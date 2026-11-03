@@ -1,11 +1,21 @@
-version: '3.8'
 services:
   ocpp_proxy:
     build: .
+    expose:
+      - "9000"
     environment:
-      - HA_URL=http://homeassistant.local:8123
-      - HA_TOKEN=YOUR_LONG_LIVED_ACCESS_TOKEN
-    ports:
-      - '9000:9000'
+      PORT: "9000"
+      LOG_DB_PATH: /data/usage_log.db
     volumes:
-      - ./config:/config
+      - ocpp-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9000/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+    labels:
+      coolify.fqdn: "https://ocpp.cyberposto.com.br"
+
+volumes:
+  ocpp-data:

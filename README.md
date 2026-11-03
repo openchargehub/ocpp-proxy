@@ -74,13 +74,7 @@ services:
 
 ### Development Setup
 ```bash
-# Install dependencies
-pip install -r requirements.txt
-
-# Run tests
 make test
-
-# Start development server
 make run
 ```
 
@@ -128,40 +122,34 @@ The proxy automatically detects OCPP versions through:
 - WebSocket subprotocol (`ocpp1.6`, `ocpp2.0.1`)
 - HTTP headers (`Sec-WebSocket-Protocol`, `X-OCPP-Version`)
 - URL query parameters (`?version=2.0.1`)
-- URL path patterns (`/charger/v2.0.1`)
+- URL path patterns on the default station (`/charger/v2.0.1`)
+- For a named charger, version comes from the subprotocol, `X-OCPP-Version`, or `?version=`. The id segment is not a version.
 
 ## 🔌 API Endpoints
 
 ### WebSocket Endpoints
-- **`/charger`** - EV charger connection (CSMS role)
-  - Auto-detects OCPP version
-  - Supports query parameters: `?version=2.0.1`
-- **`/backend?id=backend_id`** - Backend service connections
-  - Custom protocol for control requests and event subscriptions
+- **`/charger`** - Default station charge point (unrepointed chargers)
+- **`/charger/{id}`** - Charge point for one charger. The first connection creates that id. `v1.6`, `v2.0`, and `v2.0.1` stay on `default`.
+  - Id: 1 to 48 ASCII letters, digits, `_`, or `-`. Anything else is HTTP 400.
+  - Version: subprotocol, `X-OCPP-Version`, or `?version=2.0.1`
+- **`/backend?id=backend_id`** - Inbound provider for the default station
+- **`/charger/{id}/backend?id=backend_id`** - Inbound provider for that charger only. Does not create a charger.
 
 ### REST API
-- **`GET /`** - Web interface with endpoint documentation
-- **`GET /sessions`** - Charging sessions as JSON
-- **`GET /sessions.csv`** - Charging sessions as CSV
-- **`GET /status`** - Backend status and current control owner
-- **`POST /override`** - Manual control override
+- **`GET /`** and **`GET /chargers`** - Charger list (no provider secrets)
+- **`GET /chargers/{id}`** - Charger detail. Requires `ADMIN_TOKEN` via `Authorization: Bearer`, `X-Admin-Token`, or `?token=`. Missing or wrong token is 401.
+- **`POST /chargers`** - Add an id before the charge point connects. Same admin token.
+- **`GET /sessions`**, **`GET /sessions.csv`**, **`GET /status`**, **`POST /override`** - Public. Optional `charger_id` (query, or JSON field on override). Missing means `default`.
+- Disable rejects the next charge-point and provider sockets with 403 and stops outbound dials. Delete drops the row and disconnects that station. A later charge-point connection enrolls it again.
 
 ## 🏗️ Architecture
 
 ### Core Components
 
 ```
-src/ocpp_proxy/
-├── main.py                    # Application entry point & HTTP server
-├── charge_point_base.py       # Abstract base for version-agnostic interface
-├── charge_point_v16.py        # OCPP 1.6 implementation
-├── charge_point_v201.py       # OCPP 2.0.1 implementation
-├── charge_point_factory.py    # Version-specific instantiation
-├── backend_manager.py         # Multi-backend control arbitration
-├── ocpp_service_manager.py    # Outbound OCPP service connections
-├── config.py                  # Configuration management
-├── ha_bridge.py              # Home Assistant API integration
-└── logger.py                 # Session tracking & persistence
+crates/domain/        # config, version detection, control lock, session math
+crates/application/   # use cases and ports
+crates/ocpp-proxy/    # HTTP, OCPP-J, SQLite, Home Assistant, upstream clients
 ```
 
 ### Protocol Differences Handled
@@ -178,38 +166,21 @@ src/ocpp_proxy/
 ## 🧪 Testing
 
 ```bash
-# Run all tests
 make test
-
-# Run specific test types
-make test-unit         # Unit tests only
-make test-integration  # Integration tests only
-make test-e2e         # End-to-end tests only
-
-# Coverage reporting
-make test-coverage     # Generate HTML coverage report
+make test-domain-coverage
+make test-coverage
 ```
 
-Test coverage requirement: **85% minimum**
+Domain coverage gate: 99% lines and regions. Workspace line coverage gate: 90%. Live tests speak OCPP-J on real sockets.
 
 ## 🔧 Development Commands
 
 ```bash
-# Development
-make run              # Start development server
-make clean           # Clean temporary files
-
-# Testing
-make test            # Run full test suite
-make test-quick      # Quick unit tests only
-
-# Quality
-make lint            # Code linting (when configured)
-make format          # Code formatting (when configured)
-
-# Docker
-make docker-build    # Build Docker image
-make docker-run      # Run in container
+make run
+make test
+make fmt
+make clippy
+make docker-build
 ```
 
 ## 📊 Use Cases

@@ -1,58 +1,40 @@
 version: 2
 updates:
-  # Python dependencies via Poetry
-  - package-ecosystem: "pip"
+  - package-ecosystem: "cargo"
     directory: "/"
     schedule:
       interval: "weekly"
       day: "monday"
       time: "06:00"
-    reviewers:
-      - "openchargehub"
-    assignees:
-      - "openchargehub"
     commit-message:
       prefix: "deps"
       include: "scope"
     labels:
       - "dependencies"
-      - "python"
     open-pull-requests-limit: 5
 
-  # GitHub Actions
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
       day: "monday"
       time: "06:00"
-    reviewers:
-      - "openchargehub"
-    assignees:
-      - "openchargehub"
     commit-message:
       prefix: "ci"
       include: "scope"
     labels:
       - "dependencies"
-      - "github-actions"
     open-pull-requests-limit: 3
 
-  # Docker base images
   - package-ecosystem: "docker"
     directory: "/"
     schedule:
       interval: "weekly"
       day: "monday"
       time: "06:00"
-    reviewers:
-      - "openchargehub"
-    assignees:
-      - "openchargehub"
     commit-message:
       prefix: "docker"
       include: "scope"
     labels:
       - "dependencies"
-      - "docker"
     open-pull-requests-limit: 2
