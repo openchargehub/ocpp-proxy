@@ -9,7 +9,9 @@ impl ChargerRegistry for SqliteStore {
     fn list_chargers(&self) -> Result<Vec<ChargerRecord>, String> {
         self.with_conn(|conn| {
             let mut statement = conn
-                .prepare(&format!("SELECT {CHARGER_COLUMNS} FROM chargers ORDER BY id"))
+                .prepare(&format!(
+                    "SELECT {CHARGER_COLUMNS} FROM chargers ORDER BY id"
+                ))
                 .map_err(|err| format!("failed to list chargers: {err}"))?;
             let rows = statement
                 .query_map([], read_charger)
@@ -115,11 +117,8 @@ impl ChargerRegistry for SqliteStore {
     fn delete_charger(&self, id: &str) -> Result<(), String> {
         let id = id.to_string();
         self.with_conn(|conn| {
-            conn.execute(
-                "DELETE FROM charger_services WHERE charger_id = ?1",
-                [&id],
-            )
-            .map_err(|err| format!("failed to delete services for charger {id}: {err}"))?;
+            conn.execute("DELETE FROM charger_services WHERE charger_id = ?1", [&id])
+                .map_err(|err| format!("failed to delete services for charger {id}: {err}"))?;
             let changed = conn
                 .execute("DELETE FROM chargers WHERE id = ?1", [&id])
                 .map_err(|err| format!("failed to delete charger {id}: {err}"))?;

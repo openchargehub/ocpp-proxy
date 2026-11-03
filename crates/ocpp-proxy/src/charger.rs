@@ -1,14 +1,14 @@
 use std::collections::HashMap;
 
-use axum::extract::ws::{WebSocket, WebSocketUpgrade};
-use axum::extract::{OriginalUri, Query, State};
+use axum::extract::ws::WebSocket;
+use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use chrono::Utc;
 use ocpp_proxy_application::{
     fault_message_v16, fault_message_v201, note_fault, notify_session, on_boot, on_heartbeat,
-    on_meter, on_start, on_start_v201, on_status, on_transaction_stop, ChargerEvent, ChargerRegistry,
-    EnrollOutcome, Notifier, StartInput, StopInput,
+    on_meter, on_start, on_start_v201, on_status, on_transaction_stop, ChargerEvent,
+    ChargerRegistry, EnrollOutcome, Notifier, StartInput, StopInput,
 };
 use ocpp_proxy_domain::{
     parse_station_path, resolve_version, version_hint_path, ConnectionHints, OcppVersion,
@@ -17,49 +17,61 @@ use ocpp_proxy_domain::{
 use serde_json::Value;
 use tokio::sync::mpsc;
 
+use crate::admin::parse_form;
+use crate::backend::{accept_provider, extract_upgrade};
 use crate::codec::Frame;
 use crate::payload::{
     boot_result, formation, heartbeat_result, json_i64, json_str, read_boot, start_result_v16,
     stop_result_v16, transaction_event_result,
 };
 use crate::peer::{run_peer, AxumIo, InboundCall, Outbound};
-use crate::backend::open_provider;
 use crate::state::{AppState, ChargerLink, StationHandle};
 
-pub async fn charger_ws(
-    ws: WebSocketUpgrade,
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<HashMap<String, String>>,
-    uri: OriginalUri,
-) -> impl IntoResponse {
-    let route = match parse_station_path(uri.path()) {
+pub async fn charger_ws(State(state): State<AppState>, request: Request) -> impl IntoResponse {
+    let path = request.uri().path().to_string();
+    let query = parse_form(request.uri().query().unwrap_or("").as_bytes());
+    let route = match parse_station_path(&path) {
         Ok(route) => route,
         Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
     };
-    let id = match route {
+    match route {
         StationRoute::Provider { id } => {
             let provider = query
                 .get("id")
                 .filter(|value| !value.is_empty())
                 .cloned()
                 .unwrap_or_else(|| "unknown".to_string());
-            return open_provider(ws, state, id, provider).into_response();
+            accept_provider(request, state, &id, provider).await
         }
-        StationRoute::ChargePoint { id } => id,
-    };
+        StationRoute::ChargePoint { id } => {
+            accept_charge_point(request, state, id, query, path).await
+        }
+    }
+}
+
+async fn accept_charge_point(
+    request: Request,
+    state: AppState,
+    id: String,
+    query: HashMap<String, String>,
+    path: String,
+) -> axum::response::Response {
     let record = match prepare_charger(&state, &id) {
         Ok(record) => record,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let station = state.attach(&record);
+    let (ws, headers) = match extract_upgrade(request).await {
+        Ok(upgrade) => upgrade,
+        Err(response) => return *response,
+    };
     let offered = ws
         .requested_protocols()
         .filter_map(|value| value.to_str().ok())
         .collect::<Vec<_>>()
         .join(",");
-    let mut hints = connection_hints(&headers, &query, uri.path());
-    hints.path = version_hint_path(uri.path());
+    let mut hints = connection_hints(&headers, &query, &path);
+    hints.path = version_hint_path(&path);
     if !offered.is_empty() {
         hints.subprotocol = Some(offered.clone());
     }
@@ -72,26 +84,28 @@ pub async fn charger_ws(
     } else {
         ws
     };
-    upgrade
-        .on_upgrade(move |socket| run_charger(socket, state, station, version))
-        .into_response()
+    upgrade.on_upgrade(move |socket| run_charger(socket, state, station, version))
 }
 
 fn prepare_charger(
     state: &AppState,
     id: &str,
-) -> Result<ocpp_proxy_application::ChargerRecord, axum::response::Response> {
+) -> Result<ocpp_proxy_application::ChargerRecord, Box<axum::response::Response>> {
     match state.store().get_charger(id) {
-        Ok(Some(row)) if !row.enabled => Err(StatusCode::FORBIDDEN.into_response()),
+        Ok(Some(row)) if !row.enabled => Err(Box::new(StatusCode::FORBIDDEN.into_response())),
         Ok(Some(row)) => Ok(row),
         Ok(None) => match state.store().enroll(id, &state.defaults()) {
             Ok(EnrollOutcome::Created(row) | EnrollOutcome::Existing(row)) if row.enabled => {
                 Ok(row)
             }
-            Ok(_) => Err(StatusCode::FORBIDDEN.into_response()),
-            Err(err) => Err((StatusCode::INTERNAL_SERVER_ERROR, err).into_response()),
+            Ok(_) => Err(Box::new(StatusCode::FORBIDDEN.into_response())),
+            Err(err) => Err(Box::new(
+                (StatusCode::INTERNAL_SERVER_ERROR, err).into_response(),
+            )),
         },
-        Err(err) => Err((StatusCode::INTERNAL_SERVER_ERROR, err).into_response()),
+        Err(err) => Err(Box::new(
+            (StatusCode::INTERNAL_SERVER_ERROR, err).into_response(),
+        )),
     }
 }
 
@@ -131,7 +145,11 @@ async fn run_charger(
     station.clear_charger(generation);
     station.clear_version();
     let _ = reader.await;
-    tracing::info!(charger = station.id(), version = version.as_str(), "charger disconnected");
+    tracing::info!(
+        charger = station.id(),
+        version = version.as_str(),
+        "charger disconnected"
+    );
 }
 
 async fn dispatch(

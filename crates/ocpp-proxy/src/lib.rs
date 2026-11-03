@@ -1,5 +1,6 @@
 //! OCPP proxy process. Concrete adapters are constructed in [`spawn`].
 
+mod admin;
 mod backend;
 mod charger;
 mod clock;

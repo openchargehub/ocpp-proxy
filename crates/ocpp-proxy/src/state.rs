@@ -408,10 +408,6 @@ impl AppState {
         self.inner.config.ocpp_services()
     }
 
-    pub fn root_cancel(&self) -> &CancellationToken {
-        &self.inner.cancel
-    }
-
     pub fn store(&self) -> &SqliteStore {
         &self.inner.store
     }

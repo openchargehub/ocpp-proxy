@@ -122,23 +122,25 @@ The proxy automatically detects OCPP versions through:
 - WebSocket subprotocol (`ocpp1.6`, `ocpp2.0.1`)
 - HTTP headers (`Sec-WebSocket-Protocol`, `X-OCPP-Version`)
 - URL query parameters (`?version=2.0.1`)
-- URL path patterns (`/charger/v2.0.1`)
+- URL path patterns on the default station (`/charger/v2.0.1`)
+- For a named charger, version comes from the subprotocol, `X-OCPP-Version`, or `?version=`. The id segment is not a version.
 
 ## 🔌 API Endpoints
 
 ### WebSocket Endpoints
-- **`/charger`** - EV charger connection (CSMS role)
-  - Auto-detects OCPP version
-  - Supports query parameters: `?version=2.0.1`
-- **`/backend?id=backend_id`** - Backend service connections
-  - Custom protocol for control requests and event subscriptions
+- **`/charger`** - Default station charge point (unrepointed chargers)
+- **`/charger/{id}`** - Charge point for one charger. The first connection creates that id. `v1.6`, `v2.0`, and `v2.0.1` stay on `default`.
+  - Id: 1 to 48 ASCII letters, digits, `_`, or `-`. Anything else is HTTP 400.
+  - Version: subprotocol, `X-OCPP-Version`, or `?version=2.0.1`
+- **`/backend?id=backend_id`** - Inbound provider for the default station
+- **`/charger/{id}/backend?id=backend_id`** - Inbound provider for that charger only. Does not create a charger.
 
 ### REST API
-- **`GET /`** - Web interface with endpoint documentation
-- **`GET /sessions`** - Charging sessions as JSON
-- **`GET /sessions.csv`** - Charging sessions as CSV
-- **`GET /status`** - Backend status and current control owner
-- **`POST /override`** - Manual control override
+- **`GET /`** and **`GET /chargers`** - Charger list (no provider secrets)
+- **`GET /chargers/{id}`** - Charger detail. Requires `ADMIN_TOKEN` via `Authorization: Bearer`, `X-Admin-Token`, or `?token=`. Missing or wrong token is 401.
+- **`POST /chargers`** - Add an id before the charge point connects. Same admin token.
+- **`GET /sessions`**, **`GET /sessions.csv`**, **`GET /status`**, **`POST /override`** - Public. Optional `charger_id` (query, or JSON field on override). Missing means `default`.
+- Disable rejects the next charge-point and provider sockets with 403 and stops outbound dials. Delete drops the row and disconnects that station. A later charge-point connection enrolls it again.
 
 ## 🏗️ Architecture
 

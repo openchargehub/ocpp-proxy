@@ -4,15 +4,21 @@ use std::time::Duration;
 
 use axum::routing::{get, post};
 use axum::Router;
-use ocpp_proxy_application::Clock;
-use ocpp_proxy_domain::{ProxyConfig, SharingPolicy};
+use ocpp_proxy_application::{
+    ChargerDefaults, ChargerRegistry, Clock, EnrollOutcome, ServiceRecord,
+};
+use ocpp_proxy_domain::{ProxyConfig, SharingPolicy, DEFAULT_STATION_ID};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
+use crate::admin::{
+    add_charger, charger_detail, charger_list, delete_charger, delete_service_route,
+    disable_charger, enable_charger, save_policy, save_service_route,
+};
 use crate::backend::backend_ws;
 use crate::charger::charger_ws;
 use crate::ha::HaClient;
-use crate::rest::{override_control, sessions_csv, sessions_json, status, welcome};
+use crate::rest::{override_control, sessions_csv, sessions_json, status};
 use crate::state::AppState;
 use crate::store::SqliteStore;
 use crate::upstream::spawn_services;
@@ -85,14 +91,23 @@ pub async fn spawn(options: ProxyOptions) -> Result<RunningProxy, String> {
     let policy = SharingPolicy::from_config(&options.config)
         .map_err(|err| err.to_string())?
         .with_lock_timeout(options.lock_timeout);
+    let defaults = charger_defaults(&options.config, &policy);
     let store = SqliteStore::open(&options.db_path)?;
     let ha = match (&options.ha_url, &options.ha_token) {
         (Some(url), Some(token)) => Some(HaClient::new(url, token)),
         _ => None,
     };
     let cancel = CancellationToken::new();
-    let state = AppState::new(options.config, policy, store, ha, cancel.clone());
-    spawn_services(&state);
+    let state = AppState::new(
+        options.config,
+        defaults,
+        store,
+        ha,
+        cancel.clone(),
+        options.lock_timeout,
+        options.admin_token,
+    );
+    boot_saved(&state)?;
     let tick_cancel = cancel.clone();
     let tick_state = state.clone();
     tokio::spawn(async move {
@@ -101,7 +116,13 @@ pub async fn spawn(options: ProxyOptions) -> Result<RunningProxy, String> {
                 _ = tick_cancel.cancelled() => break,
                 _ = tokio::time::sleep(Duration::from_millis(50)) => {
                     let now = tick_state.clock().now_ms();
-                    tick_state.arbiter().lock().unwrap_or_else(|err| err.into_inner()).poll_timeout(now);
+                    for station in tick_state.stations() {
+                        station
+                            .arbiter()
+                            .lock()
+                            .unwrap_or_else(|err| err.into_inner())
+                            .poll_timeout(now);
+                    }
                 }
             }
         }
@@ -122,7 +143,18 @@ pub async fn spawn(options: ProxyOptions) -> Result<RunningProxy, String> {
 
 pub fn router(state: AppState) -> Router {
     Router::new()
-        .route("/", get(welcome))
+        .route("/", get(charger_list))
+        .route("/chargers", get(charger_list).post(add_charger))
+        .route("/chargers/{id}", get(charger_detail))
+        .route("/chargers/{id}/policy", post(save_policy))
+        .route("/chargers/{id}/services", post(save_service_route))
+        .route(
+            "/chargers/{id}/services/{service_id}/delete",
+            post(delete_service_route),
+        )
+        .route("/chargers/{id}/disable", post(disable_charger))
+        .route("/chargers/{id}/enable", post(enable_charger))
+        .route("/chargers/{id}/delete", post(delete_charger))
         .route("/charger", get(charger_ws))
         .route("/charger/{*rest}", get(charger_ws))
         .route("/backend", get(backend_ws))
@@ -131,6 +163,55 @@ pub fn router(state: AppState) -> Router {
         .route("/status", get(status))
         .route("/override", post(override_control))
         .with_state(state)
+}
+
+fn charger_defaults(config: &ProxyConfig, policy: &SharingPolicy) -> ChargerDefaults {
+    ChargerDefaults {
+        ocpp_version: config.ocpp_version(),
+        auto_detect: config.auto_detect_ocpp_version(),
+        allow_shared_charging: policy.allow_shared_charging,
+        preferred_provider: policy.preferred_provider.clone(),
+        blocked_providers: policy.blocked_providers.clone(),
+        allowed_providers: policy.allowed_providers.clone(),
+        presence_sensor: policy.presence_sensor.clone(),
+        override_input_boolean: policy.override_input_boolean.clone(),
+        rate_limit_seconds: policy.rate_limit_seconds,
+    }
+}
+
+fn boot_saved(state: &AppState) -> Result<(), String> {
+    if let EnrollOutcome::Created(_) = state
+        .store()
+        .enroll(DEFAULT_STATION_ID, &state.defaults())?
+    {
+        copy_yaml_services(state)?;
+    }
+    for record in state.store().list_chargers()? {
+        let enabled = record.enabled;
+        let station = state.attach(&record);
+        if enabled {
+            spawn_services(state, &station);
+        }
+    }
+    Ok(())
+}
+
+fn copy_yaml_services(state: &AppState) -> Result<(), String> {
+    for service in state.yaml_services() {
+        let version = service.version().to_string();
+        state.store().save_service(&ServiceRecord {
+            charger_id: DEFAULT_STATION_ID.to_string(),
+            id: service.id,
+            url: service.url,
+            version,
+            auth_type: service.auth_type.unwrap_or_default(),
+            username: service.username.unwrap_or_default(),
+            password: service.password.unwrap_or_default(),
+            token: service.token.unwrap_or_default(),
+            enabled: service.enabled,
+        })?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

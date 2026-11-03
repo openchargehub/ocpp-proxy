@@ -69,7 +69,17 @@ fn charger_ids_accept_letters_digits_underscore_and_hyphen() {
 
 #[test]
 fn charger_ids_reject_empty_long_dotted_and_non_ascii() {
-    for id in ["", &"a".repeat(49), "bad id", "cp.01", "v1.6", "v2.0", "v2.0.1", "充電", "a/b"] {
+    for id in [
+        "",
+        &"a".repeat(49),
+        "bad id",
+        "cp.01",
+        "v1.6",
+        "v2.0",
+        "v2.0.1",
+        "充電",
+        "a/b",
+    ] {
         let err = validate_charger_id(id).unwrap_err();
         assert_eq!(err, PathError { segment: id.into() }, "{id}");
     }

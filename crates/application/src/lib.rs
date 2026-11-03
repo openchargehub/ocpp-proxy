@@ -16,9 +16,7 @@ pub use messages::{fault_message_v16, fault_message_v201, is_fault_status, sessi
 pub use ports::{
     BackendHub, ChargerCommand, Clock, EntityState, Notifier, SessionStore, UpstreamHub,
 };
-pub use registry::{
-    ChargerDefaults, ChargerRecord, ChargerRegistry, EnrollOutcome, ServiceRecord,
-};
+pub use registry::{ChargerDefaults, ChargerRecord, ChargerRegistry, EnrollOutcome, ServiceRecord};
 pub use sessions::{
     list_sessions, note_fault, notify_session, on_boot, on_heartbeat, on_meter, on_start,
     on_start_v201, on_status, on_transaction_stop, AcceptedCall, StartInput, StopInput,

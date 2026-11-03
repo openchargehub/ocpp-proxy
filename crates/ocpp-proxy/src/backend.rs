@@ -1,58 +1,81 @@
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Query, State};
-use axum::http::StatusCode;
+use axum::extract::{FromRequestParts, Request, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use ocpp_proxy_application::{
     remote_start, remote_stop, ChargerRegistry, RemoteStart, RemoteStop, StartDecision,
     StopDecision,
 };
 use ocpp_proxy_domain::DEFAULT_STATION_ID;
-use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
+use crate::admin::parse_form;
 use crate::state::{AppState, StationHandle};
 
-#[derive(Debug, Deserialize, Default)]
-pub(crate) struct BackendQuery {
-    id: Option<String>,
+pub async fn backend_ws(State(state): State<AppState>, request: Request) -> Response {
+    let provider = provider_name(request.uri().query().unwrap_or(""));
+    accept_provider(request, state, DEFAULT_STATION_ID, provider).await
 }
 
-pub async fn backend_ws(
-    ws: WebSocketUpgrade,
-    State(state): State<AppState>,
-    Query(query): Query<BackendQuery>,
-) -> Response {
-    let provider = query
-        .id
-        .filter(|id| !id.is_empty())
-        .unwrap_or_else(|| "unknown".to_string());
-    open_provider(ws, state, DEFAULT_STATION_ID.to_string(), provider)
-}
-
-pub fn open_provider(
-    ws: WebSocketUpgrade,
+pub async fn accept_provider(
+    request: Request,
     state: AppState,
-    charger_id: String,
+    charger_id: &str,
     provider_id: String,
 ) -> Response {
-    let record = match state.store().get_charger(&charger_id) {
-        Ok(Some(row)) if !row.enabled => return StatusCode::FORBIDDEN.into_response(),
-        Ok(Some(row)) => row,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(err) => return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response(),
+    let station = match gate_provider(&state, charger_id) {
+        Ok(station) => station,
+        Err(response) => return *response,
     };
-    let station = state.attach(&record);
-    ws.on_upgrade(move |socket| run_backend(socket, state, station, provider_id))
-        .into_response()
+    accept_socket(request, move |socket| {
+        run_backend(socket, state, station, provider_id)
+    })
+    .await
 }
 
-async fn run_backend(
-    mut socket: WebSocket,
-    state: AppState,
-    station: StationHandle,
-    id: String,
-) {
+pub fn gate_provider(state: &AppState, charger_id: &str) -> Result<StationHandle, Box<Response>> {
+    match state.store().get_charger(charger_id) {
+        Ok(Some(row)) if !row.enabled => Err(Box::new(StatusCode::FORBIDDEN.into_response())),
+        Ok(Some(row)) => Ok(state.attach(&row)),
+        Ok(None) => Err(Box::new(StatusCode::NOT_FOUND.into_response())),
+        Err(err) => Err(Box::new(
+            (StatusCode::INTERNAL_SERVER_ERROR, err).into_response(),
+        )),
+    }
+}
+
+pub async fn extract_upgrade(
+    request: Request,
+) -> Result<(WebSocketUpgrade, HeaderMap), Box<Response>> {
+    let (mut parts, _) = request.into_parts();
+    let headers = parts.headers.clone();
+    match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
+        Ok(upgrade) => Ok((upgrade, headers)),
+        Err(rejection) => Err(Box::new(rejection.into_response())),
+    }
+}
+
+async fn accept_socket<F, Fut>(request: Request, callback: F) -> Response
+where
+    F: FnOnce(WebSocket) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    match extract_upgrade(request).await {
+        Ok((upgrade, _)) => upgrade.on_upgrade(callback),
+        Err(response) => *response,
+    }
+}
+
+fn provider_name(query: &str) -> String {
+    parse_form(query.as_bytes())
+        .get("id")
+        .filter(|id| !id.is_empty())
+        .cloned()
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+async fn run_backend(mut socket: WebSocket, state: AppState, station: StationHandle, id: String) {
     let (tx, mut rx) = mpsc::unbounded_channel();
     station.backends().insert(id.clone(), tx);
     station

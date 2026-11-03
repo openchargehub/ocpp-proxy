@@ -937,7 +937,6 @@ async fn two_charger_ids_do_not_share_events_or_the_lock() {
     let frame: Value = serde_json::from_str(&text_from(&mut cyber).await).unwrap();
     assert_eq!(frame[2], "RemoteStartTransaction");
     assert_eq!(frame[3]["idTag"], "CYBER");
-    no_text(&mut viario).await;
     cyber
         .send(Message::Text(
             json!([3, frame[1], {"status": "Accepted"}])
@@ -973,6 +972,7 @@ async fn two_charger_ids_do_not_share_events_or_the_lock() {
         .await
         .unwrap();
     assert!(default_status["lock_owner"].is_null());
+    no_text(&mut viario).await;
 
     fleet
         .send(Message::Text(
@@ -999,13 +999,7 @@ async fn first_connect_enrolls_and_disable_rejects_the_next_socket() {
     let bad = get(&format!("http://{}/charger/bad%20id", proxy.addr)).await;
     assert_eq!(bad.status(), 400);
 
-    let mut named = connect(
-        proxy.addr,
-        "/charger/CPCYBER01?version=2.0.1",
-        None,
-        &[],
-    )
-    .await;
+    let mut named = connect(proxy.addr, "/charger/CPCYBER01?version=2.0.1", None, &[]).await;
     let boot = rpc(
         &mut named,
         "b",
@@ -1070,6 +1064,7 @@ async fn first_connect_enrolls_and_disable_rejects_the_next_socket() {
     proxy.shutdown().await;
 }
 
+#[allow(clippy::result_large_err)]
 #[tokio::test]
 async fn outbound_service_dials_only_the_charger_it_was_saved_on() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
