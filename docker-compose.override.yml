@@ -1,0 +1,4 @@
+services:
+  ocpp_proxy:
+    ports:
+      - "9000:9000"

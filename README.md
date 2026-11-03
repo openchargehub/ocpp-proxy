@@ -74,13 +74,7 @@ services:
 
 ### Development Setup
 ```bash
-# Install dependencies
-pip install -r requirements.txt
-
-# Run tests
 make test
-
-# Start development server
 make run
 ```
 
@@ -151,17 +145,9 @@ The proxy automatically detects OCPP versions through:
 ### Core Components
 
 ```
-src/ocpp_proxy/
-├── main.py                    # Application entry point & HTTP server
-├── charge_point_base.py       # Abstract base for version-agnostic interface
-├── charge_point_v16.py        # OCPP 1.6 implementation
-├── charge_point_v201.py       # OCPP 2.0.1 implementation
-├── charge_point_factory.py    # Version-specific instantiation
-├── backend_manager.py         # Multi-backend control arbitration
-├── ocpp_service_manager.py    # Outbound OCPP service connections
-├── config.py                  # Configuration management
-├── ha_bridge.py              # Home Assistant API integration
-└── logger.py                 # Session tracking & persistence
+crates/domain/        # config, version detection, control lock, session math
+crates/application/   # use cases and ports
+crates/ocpp-proxy/    # HTTP, OCPP-J, SQLite, Home Assistant, upstream clients
 ```
 
 ### Protocol Differences Handled
@@ -178,38 +164,21 @@ src/ocpp_proxy/
 ## 🧪 Testing
 
 ```bash
-# Run all tests
 make test
-
-# Run specific test types
-make test-unit         # Unit tests only
-make test-integration  # Integration tests only
-make test-e2e         # End-to-end tests only
-
-# Coverage reporting
-make test-coverage     # Generate HTML coverage report
+make test-domain-coverage
+make test-coverage
 ```
 
-Test coverage requirement: **85% minimum**
+Domain coverage gate: 99% lines and regions. Workspace line coverage gate: 90%. Live tests speak OCPP-J on real sockets.
 
 ## 🔧 Development Commands
 
 ```bash
-# Development
-make run              # Start development server
-make clean           # Clean temporary files
-
-# Testing
-make test            # Run full test suite
-make test-quick      # Quick unit tests only
-
-# Quality
-make lint            # Code linting (when configured)
-make format          # Code formatting (when configured)
-
-# Docker
-make docker-build    # Build Docker image
-make docker-run      # Run in container
+make run
+make test
+make fmt
+make clippy
+make docker-build
 ```
 
 ## 📊 Use Cases

@@ -1,0 +1,11 @@
+[package]
+name = "ocpp-proxy-domain"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Pure OCPP proxy rules: config, version detection, arbitration, sessions"
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+serde_json = "1"
+serde_yaml = "0.9"

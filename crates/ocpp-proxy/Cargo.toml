@@ -1,0 +1,38 @@
+[package]
+name = "ocpp-proxy"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "OCPP 1.6 and 2.0.1 proxy for EV charger sharing"
+
+[[bin]]
+name = "ocpp-proxy"
+path = "src/main.rs"
+
+[dependencies]
+async-trait = "0.1"
+axum = { version = "0.8", features = ["ws"] }
+base64 = "0.23"
+chrono = { version = "0.4", features = ["serde"] }
+csv = "1"
+futures-util = "0.3"
+http = "1"
+ocpp-proxy-application = { path = "../application" }
+ocpp-proxy-domain = { path = "../domain" }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
+rust-ocpp = { version = "3", features = ["v1_6", "v2_0_1"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+futures-util = "0.3"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }

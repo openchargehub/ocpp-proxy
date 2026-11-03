@@ -1,0 +1,225 @@
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use ocpp_proxy_application::SessionStore;
+use ocpp_proxy_domain::SessionRow;
+use rusqlite::{Connection, OptionalExtension};
+
+const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS sessions (
+    timestamp TEXT,
+    backend_id TEXT,
+    duration_s REAL,
+    energy_kwh REAL,
+    revenue REAL
+)";
+
+#[derive(Clone, Debug)]
+pub struct SqliteStore {
+    path: PathBuf,
+}
+
+impl SqliteStore {
+    pub fn open(path: impl Into<PathBuf>) -> Result<Self, String> {
+        let path = path.into();
+        let store = Self { path };
+        store.with_conn(|conn| {
+            conn.execute_batch(SCHEMA).map_err(|err| err.to_string())?;
+            Ok(())
+        })?;
+        Ok(store)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn with_conn<T>(
+        &self,
+        body: impl FnOnce(&Connection) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let conn = Connection::open(&self.path).map_err(|err| {
+            format!(
+                "failed to open session database {}: {err}",
+                self.path.display()
+            )
+        })?;
+        conn.busy_timeout(Duration::from_secs(5)).map_err(|err| {
+            format!(
+                "failed to set busy timeout on {}: {err}",
+                self.path.display()
+            )
+        })?;
+        body(&conn)
+    }
+}
+
+impl SessionStore for SqliteStore {
+    fn insert(&self, row: &SessionRow) -> Result<(), String> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO sessions (timestamp, backend_id, duration_s, energy_kwh, revenue) VALUES (?1, ?2, ?3, ?4, ?5)",
+                (&row.timestamp, &row.backend_id, row.duration_s, row.energy_kwh, row.revenue),
+            )
+            .map_err(|err| format!("failed to insert session for {}: {err}", row.backend_id))?;
+            Ok(())
+        })
+    }
+
+    fn list(&self) -> Result<Vec<SessionRow>, String> {
+        self.with_conn(|conn| {
+            let mut statement = conn
+                .prepare(
+                    "SELECT timestamp, backend_id, duration_s, energy_kwh, revenue FROM sessions ORDER BY timestamp",
+                )
+                .map_err(|err| format!("failed to read sessions: {err}"))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok(SessionRow {
+                        timestamp: row.get(0)?,
+                        backend_id: row.get(1)?,
+                        duration_s: row.get(2)?,
+                        energy_kwh: row.get(3)?,
+                        revenue: row.get(4)?,
+                    })
+                })
+                .map_err(|err| format!("failed to read sessions: {err}"))?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(|err| format!("failed to read sessions: {err}"))
+        })
+    }
+}
+
+pub fn column_names(path: &Path) -> Result<Vec<String>, String> {
+    let store = SqliteStore {
+        path: path.to_path_buf(),
+    };
+    store.with_conn(|conn| {
+        let mut statement = conn
+            .prepare("PRAGMA table_info(sessions)")
+            .map_err(|err| err.to_string())?;
+        let names = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|err| err.to_string())?;
+        names
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| err.to_string())
+    })
+}
+
+pub fn table_exists(path: &Path) -> Result<bool, String> {
+    let store = SqliteStore {
+        path: path.to_path_buf(),
+    };
+    store.with_conn(|conn| {
+        let found: Option<String> = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'sessions'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|err| err.to_string())?;
+        Ok(found.is_some())
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ocpp_proxy_application::SessionStore;
+    use std::thread;
+
+    fn temp_db(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "ocpp-proxy-{name}-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    fn row(ts: &str, id: &str, energy: f64) -> SessionRow {
+        SessionRow {
+            timestamp: ts.into(),
+            backend_id: id.into(),
+            duration_s: energy,
+            energy_kwh: energy,
+            revenue: 0.0,
+        }
+    }
+
+    #[test]
+    fn schema_order_unicode_precision_and_reopen() {
+        let path = temp_db("store");
+        let store = SqliteStore::open(&path).unwrap();
+        assert!(table_exists(&path).unwrap());
+        assert_eq!(
+            column_names(&path).unwrap(),
+            vec![
+                "timestamp",
+                "backend_id",
+                "duration_s",
+                "energy_kwh",
+                "revenue"
+            ]
+        );
+        assert!(store.list().unwrap().is_empty());
+        store
+            .insert(&row("2023-01-01T12:00:00+00:00", "b", 0.0))
+            .unwrap();
+        store
+            .insert(&SessionRow {
+                timestamp: "2023-01-01T13:00:00+00:00".into(),
+                backend_id: "充電".into(),
+                duration_s: -1.5,
+                energy_kwh: 1.23456789,
+                revenue: -0.25,
+            })
+            .unwrap();
+        store
+            .insert(&row("2023-01-01T11:00:00+00:00", "a", 2.0))
+            .unwrap();
+        let rows = store.list().unwrap();
+        assert_eq!(rows[0].backend_id, "a");
+        assert_eq!(rows[1].energy_kwh, 0.0);
+        assert_eq!(rows[2].backend_id, "充電");
+        assert!((rows[2].energy_kwh - 1.23456789).abs() < 1e-6);
+        assert_eq!(rows[2].duration_s, -1.5);
+        drop(store);
+        let reopened = SqliteStore::open(&path).unwrap();
+        assert_eq!(reopened.list().unwrap().len(), 3);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn concurrent_inserts_and_missing_directory() {
+        let path = temp_db("concurrent");
+        let store = SqliteStore::open(&path).unwrap();
+        let mut threads = Vec::new();
+        for index in 0..8 {
+            let store = store.clone();
+            threads.push(thread::spawn(move || {
+                store
+                    .insert(&row(
+                        &format!("2023-01-01T12:00:{index:02}+00:00"),
+                        &format!("id-{index}"),
+                        index as f64,
+                    ))
+                    .unwrap();
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(store.list().unwrap().len(), 8);
+        let missing = SqliteStore::open("/tmp/ocpp-proxy-missing-dir/nope/usage.db");
+        assert!(missing
+            .unwrap_err()
+            .contains("failed to open session database"));
+        let _ = std::fs::remove_file(&path);
+    }
+}

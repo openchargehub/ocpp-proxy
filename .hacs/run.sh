@@ -25,7 +25,6 @@ if bashio::var.has_value "$(bashio::config 'override_input_boolean')"; then
     bashio::log.info "- Override control: $(bashio::config 'override_input_boolean')"
 fi
 
-# Start the OCPP Proxy
+# Start the OCPP Proxy. The add-on shell stays bashio; the process is the Rust binary.
 bashio::log.info "Starting OCPP Proxy on port ${PORT}..."
-cd /app
-python -m src.ocpp_proxy.main
+exec /usr/bin/ocpp-proxy

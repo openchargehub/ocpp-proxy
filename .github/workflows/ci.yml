@@ -2,100 +2,41 @@ name: CI
 
 on:
   push:
-    branches: [ main ]
   pull_request:
-    branches: [ main ]
 
 jobs:
   test:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: ["3.11", "3.12"]
-
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
 
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v5
-      with:
-        python-version: ${{ matrix.python-version }}
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy, llvm-tools-preview
 
-    - name: Install Poetry
-      uses: snok/install-poetry@v1
-      with:
-        version: latest
-        virtualenvs-create: true
-        virtualenvs-in-project: true
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly
+          components: llvm-tools-preview
 
-    - name: Load cached venv
-      id: cached-poetry-dependencies
-      uses: actions/cache@v4
-      with:
-        path: .venv
-        key: venv-${{ runner.os }}-${{ matrix.python-version }}-${{ hashFiles('**/poetry.lock') }}
+      - uses: taiki-e/install-action@v2.88.0
+        with:
+          tool: cargo-llvm-cov
 
-    - name: Install dependencies
-      if: steps.cached-poetry-dependencies.outputs.cache-hit != 'true'
-      run: poetry install --no-interaction --no-root
+      - name: Format
+        run: cargo fmt --all -- --check
 
-    - name: Install project
-      run: poetry install --no-interaction
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
-    - name: Run tests with coverage
-      run: |
-        make test-coverage
+      - name: Test
+        run: cargo test --workspace
 
-    - name: Upload coverage reports to Codecov
-      if: matrix.python-version == '3.11'
-      uses: codecov/codecov-action@v5
-      with:
-        file: ./coverage.xml
-        fail_ci_if_error: true
+      - name: Domain coverage
+        # 99 rather than 100: serde_json::Number::as_f64 has an unreachable None
+        # for every number this parser can build. Lines and regions otherwise match.
+        run: cargo +nightly llvm-cov -p ocpp-proxy-domain --branch --fail-under-lines 99 --fail-under-regions 99
 
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v4
-
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: "3.11"
-
-    - name: Install Poetry
-      uses: snok/install-poetry@v1
-
-    - name: Install dependencies
-      run: poetry install
-
-    - name: Check code formatting (if configured)
-      run: |
-        make format-check
-
-    - name: Run linting (if configured)
-      run: |
-        make lint
-
-    - name: Type checking (if configured)
-      run: |
-        make type-check
-
-  security:
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v4
-
-    - name: Run Trivy vulnerability scanner
-      uses: aquasecurity/trivy-action@master
-      with:
-        scan-type: 'fs'
-        scan-ref: '.'
-        format: 'sarif'
-        output: 'trivy-results.sarif'
-
-    - name: Upload Trivy scan results to GitHub Security tab
-      uses: github/codeql-action/upload-sarif@v3
-      if: always()
-      with:
-        sarif_file: 'trivy-results.sarif'
+      - name: Workspace coverage
+        run: cargo llvm-cov --workspace --fail-under-lines 90
