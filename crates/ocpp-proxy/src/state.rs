@@ -1,8 +1,13 @@
 use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard};
+use std::time::Duration;
 
-use ocpp_proxy_application::{BackendHub, ChargerEvent, Clock, UpstreamHub};
-use ocpp_proxy_domain::{Arbiter, OcppVersion, ProxyConfig, SessionLedger, SharingPolicy};
+use ocpp_proxy_application::{
+    BackendHub, ChargerDefaults, ChargerEvent, ChargerRecord, Clock, UpstreamHub,
+};
+use ocpp_proxy_domain::{
+    Arbiter, OcppServiceConfig, OcppVersion, ProxyConfig, SessionLedger, SharingPolicy,
+};
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
@@ -58,6 +63,15 @@ impl BackendSockets {
             .lock()
             .unwrap_or_else(|err| err.into_inner())
             .retain(|(name, _)| name != id);
+    }
+
+    pub fn ids(&self) -> Vec<String> {
+        self.senders
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect()
     }
 
     fn broadcast_text(&self, text: &str) {
@@ -120,6 +134,13 @@ impl UpstreamSet {
             .unwrap_or_else(|err| err.into_inner())
             .clone()
     }
+
+    pub fn clear(&self) {
+        self.status
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clear();
+    }
 }
 
 impl UpstreamHub for UpstreamSet {
@@ -129,63 +150,50 @@ impl UpstreamHub for UpstreamSet {
 }
 
 #[derive(Clone)]
-pub struct AppState {
-    inner: std::sync::Arc<Inner>,
+pub struct StationHandle {
+    inner: std::sync::Arc<StationInner>,
 }
 
-pub struct Inner {
-    pub config: ProxyConfig,
-    pub arbiter: Mutex<Arbiter>,
-    pub ledger: Mutex<SessionLedger>,
-    pub store: SqliteStore,
-    pub ha: Option<HaClient>,
-    pub clock: SystemClock,
-    pub backends: BackendSockets,
-    pub upstream: UpstreamSet,
-    pub cancel: CancellationToken,
+struct StationInner {
+    id: String,
+    arbiter: Mutex<Arbiter>,
+    ledger: Mutex<SessionLedger>,
+    backends: BackendSockets,
+    upstream: UpstreamSet,
     charger: Mutex<Option<ActiveCharger>>,
-    charger_generation: Mutex<u64>,
+    generation: Mutex<u64>,
+    cancel: CancellationToken,
+    services: Mutex<CancellationToken>,
+    boot: Mutex<Option<(String, String)>>,
+    live_version: Mutex<Option<OcppVersion>>,
 }
 
-impl AppState {
-    pub fn new(
-        config: ProxyConfig,
-        policy: SharingPolicy,
-        store: SqliteStore,
-        ha: Option<HaClient>,
-        cancel: CancellationToken,
-    ) -> Self {
+impl StationHandle {
+    fn open(record: &ChargerRecord, lock_timeout: Duration, cancel: CancellationToken) -> Self {
+        let services = cancel.child_token();
         Self {
-            inner: std::sync::Arc::new(Inner {
-                config,
-                arbiter: Mutex::new(Arbiter::new(policy)),
+            inner: std::sync::Arc::new(StationInner {
+                id: record.id.clone(),
+                arbiter: Mutex::new(Arbiter::new(policy_from(record, lock_timeout))),
                 ledger: Mutex::new(SessionLedger::new()),
-                store,
-                ha,
-                clock: SystemClock,
                 backends: BackendSockets::new(),
                 upstream: UpstreamSet::new(),
-                cancel,
                 charger: Mutex::new(None),
-                charger_generation: Mutex::new(0),
+                generation: Mutex::new(0),
+                cancel,
+                services: Mutex::new(services),
+                boot: Mutex::new(None),
+                live_version: Mutex::new(None),
             }),
         }
     }
 
-    pub fn config_version(&self) -> String {
-        self.inner.config.ocpp_version()
+    pub fn id(&self) -> &str {
+        &self.inner.id
     }
 
-    pub fn auto_detect(&self) -> bool {
-        self.inner.config.auto_detect_ocpp_version()
-    }
-
-    pub fn services(&self) -> Vec<ocpp_proxy_domain::OcppServiceConfig> {
-        self.inner.config.ocpp_services()
-    }
-
-    pub fn root_cancel(&self) -> &CancellationToken {
-        &self.inner.cancel
+    pub fn arbiter(&self) -> &Mutex<Arbiter> {
+        &self.inner.arbiter
     }
 
     pub fn ledger(&self) -> MutexGuard<'_, SessionLedger> {
@@ -193,26 +201,6 @@ impl AppState {
             .ledger
             .lock()
             .unwrap_or_else(|err| err.into_inner())
-    }
-
-    pub fn store(&self) -> &SqliteStore {
-        &self.inner.store
-    }
-
-    pub fn clock_iso(&self) -> String {
-        self.inner.clock.now_iso()
-    }
-
-    pub fn clock(&self) -> &SystemClock {
-        &self.inner.clock
-    }
-
-    pub fn ha(&self) -> Option<&HaClient> {
-        self.inner.ha.as_ref()
-    }
-
-    pub fn arbiter(&self) -> &Mutex<Arbiter> {
-        &self.inner.arbiter
     }
 
     pub fn backends(&self) -> &BackendSockets {
@@ -223,10 +211,67 @@ impl AppState {
         &self.inner.upstream
     }
 
+    pub fn cancel(&self) -> &CancellationToken {
+        &self.inner.cancel
+    }
+
+    pub fn connected(&self) -> bool {
+        self.charger_link().is_some()
+    }
+
+    pub fn boot(&self) -> Option<(String, String)> {
+        self.inner
+            .boot
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone()
+    }
+
+    pub fn set_boot(&self, vendor: &str, model: &str) {
+        *self
+            .inner
+            .boot
+            .lock()
+            .unwrap_or_else(|err| err.into_inner()) = Some((vendor.to_string(), model.to_string()));
+    }
+
+    pub fn set_version(&self, version: OcppVersion) {
+        *self
+            .inner
+            .live_version
+            .lock()
+            .unwrap_or_else(|err| err.into_inner()) = Some(version);
+    }
+
+    pub fn clear_version(&self) {
+        *self
+            .inner
+            .live_version
+            .lock()
+            .unwrap_or_else(|err| err.into_inner()) = None;
+    }
+
+    pub fn version_label(&self, fallback: &str) -> String {
+        self.inner
+            .live_version
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .map(|version| version.as_str().to_string())
+            .unwrap_or_else(|| fallback.to_string())
+    }
+
+    pub fn apply_policy(&self, policy: SharingPolicy) {
+        *self
+            .arbiter()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .policy_mut() = policy;
+    }
+
     pub fn replace_charger(&self, link: ChargerLink, cancel: CancellationToken) -> u64 {
         let mut generation = self
             .inner
-            .charger_generation
+            .generation
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         *generation += 1;
@@ -272,4 +317,183 @@ impl AppState {
             }
         }
     }
+
+    pub fn replace_service_cancel(&self) -> CancellationToken {
+        let mut slot = self
+            .inner
+            .services
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        slot.cancel();
+        let next = self.inner.cancel.child_token();
+        *slot = next.clone();
+        self.upstream().clear();
+        next
+    }
+
+    pub fn stop_services(&self) {
+        self.inner
+            .services
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .cancel();
+        self.upstream().clear();
+    }
+
+    pub fn shutdown(&self) {
+        self.inner.cancel.cancel();
+    }
+}
+
+pub fn policy_from(record: &ChargerRecord, lock_timeout: Duration) -> SharingPolicy {
+    SharingPolicy {
+        allow_shared_charging: record.allow_shared_charging,
+        preferred_provider: record.preferred_provider.clone(),
+        blocked_providers: record.blocked_providers.clone(),
+        allowed_providers: record.allowed_providers.clone(),
+        presence_sensor: record.presence_sensor.clone(),
+        override_input_boolean: record.override_input_boolean.clone(),
+        rate_limit_seconds: record.rate_limit_seconds,
+        lock_timeout,
+    }
+}
+
+#[derive(Clone)]
+pub struct AppState {
+    inner: std::sync::Arc<Inner>,
+}
+
+pub struct Inner {
+    pub config: ProxyConfig,
+    pub defaults: ChargerDefaults,
+    pub store: SqliteStore,
+    pub ha: Option<HaClient>,
+    pub clock: SystemClock,
+    pub cancel: CancellationToken,
+    pub lock_timeout: Duration,
+    pub admin_token: Option<String>,
+    stations: Mutex<BTreeMap<String, StationHandle>>,
+}
+
+impl AppState {
+    pub fn new(
+        config: ProxyConfig,
+        defaults: ChargerDefaults,
+        store: SqliteStore,
+        ha: Option<HaClient>,
+        cancel: CancellationToken,
+        lock_timeout: Duration,
+        admin_token: Option<String>,
+    ) -> Self {
+        Self {
+            inner: std::sync::Arc::new(Inner {
+                config,
+                defaults,
+                store,
+                ha,
+                clock: SystemClock,
+                cancel,
+                lock_timeout,
+                admin_token,
+                stations: Mutex::new(BTreeMap::new()),
+            }),
+        }
+    }
+
+    pub fn defaults(&self) -> ChargerDefaults {
+        self.inner.defaults.clone()
+    }
+
+    pub fn yaml_services(&self) -> Vec<OcppServiceConfig> {
+        self.inner.config.ocpp_services()
+    }
+
+    pub fn root_cancel(&self) -> &CancellationToken {
+        &self.inner.cancel
+    }
+
+    pub fn store(&self) -> &SqliteStore {
+        &self.inner.store
+    }
+
+    pub fn clock_iso(&self) -> String {
+        self.inner.clock.now_iso()
+    }
+
+    pub fn clock(&self) -> &SystemClock {
+        &self.inner.clock
+    }
+
+    pub fn ha(&self) -> Option<&HaClient> {
+        self.inner.ha.as_ref()
+    }
+
+    pub fn lock_timeout(&self) -> Duration {
+        self.inner.lock_timeout
+    }
+
+    pub fn authorize(&self, presented: Option<&str>) -> bool {
+        match (self.inner.admin_token.as_deref(), presented) {
+            (Some(expected), Some(presented)) => tokens_match(expected, presented),
+            _ => false,
+        }
+    }
+
+    pub fn attach(&self, record: &ChargerRecord) -> StationHandle {
+        let mut stations = self
+            .inner
+            .stations
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if let Some(existing) = stations.get(&record.id) {
+            return existing.clone();
+        }
+        let station = StationHandle::open(
+            record,
+            self.inner.lock_timeout,
+            self.inner.cancel.child_token(),
+        );
+        stations.insert(record.id.clone(), station.clone());
+        station
+    }
+
+    pub fn station(&self, id: &str) -> Option<StationHandle> {
+        self.inner
+            .stations
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .get(id)
+            .cloned()
+    }
+
+    pub fn stations(&self) -> Vec<StationHandle> {
+        self.inner
+            .stations
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    pub fn remove_station(&self, id: &str) -> Option<StationHandle> {
+        self.inner
+            .stations
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .remove(id)
+    }
+}
+
+fn tokens_match(expected: &str, presented: &str) -> bool {
+    let expected = expected.as_bytes();
+    let presented = presented.as_bytes();
+    if expected.len() != presented.len() {
+        return false;
+    }
+    let mut diff = 0_u8;
+    for (left, right) in expected.iter().zip(presented.iter()) {
+        diff |= left ^ right;
+    }
+    diff == 0
 }

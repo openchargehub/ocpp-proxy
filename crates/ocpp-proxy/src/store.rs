@@ -11,7 +11,34 @@ CREATE TABLE IF NOT EXISTS sessions (
     backend_id TEXT,
     duration_s REAL,
     energy_kwh REAL,
-    revenue REAL
+    revenue REAL,
+    charger_id TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS chargers (
+    id TEXT PRIMARY KEY,
+    enabled INTEGER NOT NULL,
+    ocpp_version TEXT NOT NULL,
+    auto_detect INTEGER NOT NULL,
+    allow_shared_charging INTEGER NOT NULL,
+    preferred_provider TEXT NOT NULL,
+    blocked_providers TEXT NOT NULL,
+    allowed_providers TEXT NOT NULL,
+    presence_sensor TEXT NOT NULL,
+    override_input_boolean TEXT NOT NULL,
+    rate_limit_seconds INTEGER NOT NULL,
+    last_seen TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS charger_services (
+    charger_id TEXT NOT NULL,
+    id TEXT NOT NULL,
+    url TEXT NOT NULL,
+    version TEXT NOT NULL,
+    auth_type TEXT NOT NULL,
+    username TEXT NOT NULL,
+    password TEXT NOT NULL,
+    token TEXT NOT NULL,
+    enabled INTEGER NOT NULL,
+    PRIMARY KEY (charger_id, id)
 )";
 
 #[derive(Clone, Debug)]
@@ -25,6 +52,7 @@ impl SqliteStore {
         let store = Self { path };
         store.with_conn(|conn| {
             conn.execute_batch(SCHEMA).map_err(|err| err.to_string())?;
+            ensure_charger_id(conn)?;
             Ok(())
         })?;
         Ok(store)
@@ -34,7 +62,7 @@ impl SqliteStore {
         &self.path
     }
 
-    fn with_conn<T>(
+    pub(crate) fn with_conn<T>(
         &self,
         body: impl FnOnce(&Connection) -> Result<T, String>,
     ) -> Result<T, String> {
@@ -58,8 +86,15 @@ impl SessionStore for SqliteStore {
     fn insert(&self, row: &SessionRow) -> Result<(), String> {
         self.with_conn(|conn| {
             conn.execute(
-                "INSERT INTO sessions (timestamp, backend_id, duration_s, energy_kwh, revenue) VALUES (?1, ?2, ?3, ?4, ?5)",
-                (&row.timestamp, &row.backend_id, row.duration_s, row.energy_kwh, row.revenue),
+                "INSERT INTO sessions (timestamp, backend_id, duration_s, energy_kwh, revenue, charger_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                (
+                    &row.timestamp,
+                    &row.backend_id,
+                    row.duration_s,
+                    row.energy_kwh,
+                    row.revenue,
+                    &row.charger_id,
+                ),
             )
             .map_err(|err| format!("failed to insert session for {}: {err}", row.backend_id))?;
             Ok(())
@@ -70,23 +105,76 @@ impl SessionStore for SqliteStore {
         self.with_conn(|conn| {
             let mut statement = conn
                 .prepare(
-                    "SELECT timestamp, backend_id, duration_s, energy_kwh, revenue FROM sessions ORDER BY timestamp",
+                    "SELECT timestamp, backend_id, duration_s, energy_kwh, revenue, IFNULL(charger_id, '') FROM sessions ORDER BY timestamp",
                 )
                 .map_err(|err| format!("failed to read sessions: {err}"))?;
             let rows = statement
-                .query_map([], |row| {
-                    Ok(SessionRow {
-                        timestamp: row.get(0)?,
-                        backend_id: row.get(1)?,
-                        duration_s: row.get(2)?,
-                        energy_kwh: row.get(3)?,
-                        revenue: row.get(4)?,
-                    })
-                })
+                .query_map([], read_session)
                 .map_err(|err| format!("failed to read sessions: {err}"))?;
             rows.collect::<Result<Vec<_>, _>>().map_err(|err| format!("failed to read sessions: {err}"))
         })
     }
+}
+
+impl SqliteStore {
+    pub fn sessions_for(&self, charger_id: &str) -> Result<Vec<SessionRow>, String> {
+        let charger_id = charger_id.to_string();
+        self.with_conn(|conn| {
+            let mut statement = conn
+                .prepare(
+                    "SELECT timestamp, backend_id, duration_s, energy_kwh, revenue, IFNULL(charger_id, '')
+                     FROM sessions
+                     WHERE charger_id = ?1
+                        OR (?1 = 'default' AND IFNULL(charger_id, '') = '')
+                     ORDER BY timestamp",
+                )
+                .map_err(|err| format!("failed to read sessions: {err}"))?;
+            let rows = statement
+                .query_map([&charger_id], read_session)
+                .map_err(|err| format!("failed to read sessions: {err}"))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|err| format!("failed to read sessions: {err}"))
+        })
+    }
+}
+
+fn read_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
+    Ok(SessionRow {
+        timestamp: row.get(0)?,
+        backend_id: row.get(1)?,
+        duration_s: row.get(2)?,
+        energy_kwh: row.get(3)?,
+        revenue: row.get(4)?,
+        charger_id: row.get(5)?,
+    })
+}
+
+fn ensure_charger_id(conn: &Connection) -> Result<(), String> {
+    if column_on(conn, "sessions", "charger_id")? {
+        return Ok(());
+    }
+    conn.execute(
+        "ALTER TABLE sessions ADD COLUMN charger_id TEXT NOT NULL DEFAULT ''",
+        [],
+    )
+    .map_err(|err| format!("failed to add sessions.charger_id: {err}"))?;
+    Ok(())
+}
+
+fn column_on(conn: &Connection, table: &str, column: &str) -> Result<bool, String> {
+    let sql = format!("PRAGMA table_info({table})");
+    let mut statement = conn
+        .prepare(&sql)
+        .map_err(|err| format!("failed to read {table} columns: {err}"))?;
+    let names = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|err| format!("failed to read {table} columns: {err}"))?;
+    for name in names {
+        if name.map_err(|err| format!("failed to read {table} columns: {err}"))? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub fn column_names(path: &Path) -> Result<Vec<String>, String> {
@@ -149,6 +237,7 @@ mod tests {
             duration_s: energy,
             energy_kwh: energy,
             revenue: 0.0,
+            charger_id: String::new(),
         }
     }
 
@@ -164,7 +253,8 @@ mod tests {
                 "backend_id",
                 "duration_s",
                 "energy_kwh",
-                "revenue"
+                "revenue",
+                "charger_id"
             ]
         );
         assert!(store.list().unwrap().is_empty());
@@ -178,6 +268,7 @@ mod tests {
                 duration_s: -1.5,
                 energy_kwh: 1.23456789,
                 revenue: -0.25,
+                charger_id: String::new(),
             })
             .unwrap();
         store
@@ -220,6 +311,107 @@ mod tests {
         assert!(missing
             .unwrap_err()
             .contains("failed to open session database"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn defaults(version: &str) -> ocpp_proxy_application::ChargerDefaults {
+        ocpp_proxy_application::ChargerDefaults {
+            ocpp_version: version.into(),
+            auto_detect: true,
+            allow_shared_charging: true,
+            preferred_provider: "energy".into(),
+            blocked_providers: vec!["spam".into()],
+            allowed_providers: vec!["energy".into()],
+            presence_sensor: "binary_sensor.home".into(),
+            override_input_boolean: "input_boolean.override".into(),
+            rate_limit_seconds: 10,
+        }
+    }
+
+    #[test]
+    fn enroll_keeps_the_first_row_and_services_stay_on_that_charger() {
+        use ocpp_proxy_application::{ChargerRegistry, EnrollOutcome};
+
+        let path = temp_db("registry");
+        let store = SqliteStore::open(&path).unwrap();
+        let created = store.enroll("CPCYBER01", &defaults("1.6")).unwrap();
+        let EnrollOutcome::Created(row) = created else {
+            panic!("first connect must insert the row");
+        };
+        assert!(row.enabled);
+        assert_eq!(row.ocpp_version, "1.6");
+        store.set_enabled("CPCYBER01", false).unwrap();
+        let again = store.enroll("CPCYBER01", &defaults("2.0.1")).unwrap();
+        let EnrollOutcome::Existing(kept) = again else {
+            panic!("second enroll must not replace the row");
+        };
+        assert!(!kept.enabled);
+        assert_eq!(kept.ocpp_version, "1.6");
+
+        store
+            .save_service(&ocpp_proxy_application::ServiceRecord {
+                charger_id: "CPCYBER01".into(),
+                id: "grid".into(),
+                url: "ws://grid".into(),
+                version: "1.6".into(),
+                auth_type: "token".into(),
+                username: String::new(),
+                password: String::new(),
+                token: "secret".into(),
+                enabled: true,
+            })
+            .unwrap();
+        assert!(store.list_services("CPVIARIO001").unwrap().is_empty());
+        let services = store.list_services("CPCYBER01").unwrap();
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].token, "secret");
+        store.delete_charger("CPCYBER01").unwrap();
+        assert!(store.get_charger("CPCYBER01").unwrap().is_none());
+        assert!(store.list_services("CPCYBER01").unwrap().is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn old_session_rows_stay_readable_with_empty_charger_id() {
+        use ocpp_proxy_application::SessionStore;
+        use rusqlite::Connection;
+
+        let path = temp_db("legacy-sessions");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                timestamp TEXT,
+                backend_id TEXT,
+                duration_s REAL,
+                energy_kwh REAL,
+                revenue REAL
+            )",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (timestamp, backend_id, duration_s, energy_kwh, revenue) VALUES ('2020-01-01T00:00:00Z', 'old', 1.0, 2.0, 0.0)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let store = SqliteStore::open(&path).unwrap();
+        let rows = store.sessions_for("default").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].backend_id, "old");
+        assert_eq!(rows[0].charger_id, "");
+        assert!(store.sessions_for("CPCYBER01").unwrap().is_empty());
+        store
+            .insert(&SessionRow {
+                timestamp: "2024-01-01T00:00:00Z".into(),
+                backend_id: "energy".into(),
+                duration_s: 3.0,
+                energy_kwh: 4.0,
+                revenue: 0.0,
+                charger_id: "CPCYBER01".into(),
+            })
+            .unwrap();
+        assert_eq!(store.sessions_for("CPCYBER01").unwrap().len(), 1);
+        assert_eq!(store.sessions_for("default").unwrap().len(), 1);
         let _ = std::fs::remove_file(&path);
     }
 }

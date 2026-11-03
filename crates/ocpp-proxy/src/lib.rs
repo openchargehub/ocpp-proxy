@@ -9,6 +9,7 @@ mod html;
 mod link;
 mod payload;
 mod peer;
+mod registry;
 mod rest;
 mod spawn;
 mod state;

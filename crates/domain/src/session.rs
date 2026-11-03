@@ -16,6 +16,7 @@ pub struct SessionRow {
     pub duration_s: f64,
     pub energy_kwh: f64,
     pub revenue: f64,
+    pub charger_id: String,
 }
 
 /// Computed when a transaction ends. Revenue stays zero.
@@ -35,6 +36,7 @@ impl UsageRecord {
             duration_s: self.duration_s,
             energy_kwh: self.energy_kwh,
             revenue: self.revenue,
+            charger_id: String::new(),
         }
     }
 }

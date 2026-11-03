@@ -90,6 +90,7 @@ pub struct StopInput<'a> {
     pub transaction_id: Value,
     pub owner: Option<&'a str>,
     pub logged_at: &'a str,
+    pub charger_id: &'a str,
 }
 
 pub fn on_start(
@@ -147,7 +148,8 @@ pub fn on_transaction_stop(
     };
     emit(&event, backends, upstream);
     let usage = ledger.stop(input.tx_id, input.meter_stop, input.timestamp, input.owner)?;
-    let row = usage.to_row(input.logged_at);
+    let mut row = usage.to_row(input.logged_at);
+    row.charger_id = input.charger_id.to_string();
     store.insert(&row).ok()?;
     Some(session_ended_message(
         &usage.backend_id,

@@ -24,6 +24,7 @@ pub struct ProxyOptions {
     pub lock_timeout: Duration,
     pub ha_url: Option<String>,
     pub ha_token: Option<String>,
+    pub admin_token: Option<String>,
 }
 
 impl ProxyOptions {
@@ -46,6 +47,9 @@ impl ProxyOptions {
             (Some(url), Some(token)) => (Some(url), Some(token)),
             _ => (None, None),
         };
+        let admin_token = std::env::var("ADMIN_TOKEN")
+            .ok()
+            .filter(|value| !value.is_empty());
         Ok(Self {
             config,
             db_path: PathBuf::from(db_path),
@@ -53,6 +57,7 @@ impl ProxyOptions {
             lock_timeout: Duration::from_secs(60),
             ha_url,
             ha_token,
+            admin_token,
         })
     }
 }

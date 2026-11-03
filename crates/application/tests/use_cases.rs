@@ -588,6 +588,7 @@ fn session_math_is_logged_and_unknown_stop_is_silent() {
             transaction_id: json!(1),
             owner: Some("alpha"),
             logged_at: "2023-01-01T12:30:01+00:00",
+            charger_id: "CPCYBER01",
         },
         &backends,
         &upstream,
@@ -597,6 +598,7 @@ fn session_math_is_logged_and_unknown_stop_is_silent() {
     let rows = list_sessions(&store).unwrap();
     assert_eq!(rows[0].energy_kwh, 5.0);
     assert_eq!(rows[0].backend_id, "alpha");
+    assert_eq!(rows[0].charger_id, "CPCYBER01");
     assert!(on_transaction_stop(
         &mut ledger,
         &store,
@@ -607,6 +609,7 @@ fn session_math_is_logged_and_unknown_stop_is_silent() {
             transaction_id: json!("missing"),
             owner: None,
             logged_at: "2023-01-01T12:40:00Z",
+            charger_id: "CPCYBER01",
         },
         &backends,
         &upstream,

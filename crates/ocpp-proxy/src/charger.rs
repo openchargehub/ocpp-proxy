@@ -7,10 +7,13 @@ use axum::response::IntoResponse;
 use chrono::Utc;
 use ocpp_proxy_application::{
     fault_message_v16, fault_message_v201, note_fault, notify_session, on_boot, on_heartbeat,
-    on_meter, on_start, on_start_v201, on_status, on_transaction_stop, ChargerEvent, Notifier,
-    StartInput, StopInput,
+    on_meter, on_start, on_start_v201, on_status, on_transaction_stop, ChargerEvent, ChargerRegistry,
+    EnrollOutcome, Notifier, StartInput, StopInput,
 };
-use ocpp_proxy_domain::{resolve_version, ConnectionHints, OcppVersion};
+use ocpp_proxy_domain::{
+    parse_station_path, resolve_version, version_hint_path, ConnectionHints, OcppVersion,
+    StationRoute,
+};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
@@ -20,7 +23,8 @@ use crate::payload::{
     stop_result_v16, transaction_event_result,
 };
 use crate::peer::{run_peer, AxumIo, InboundCall, Outbound};
-use crate::state::{AppState, ChargerLink};
+use crate::backend::open_provider;
+use crate::state::{AppState, ChargerLink, StationHandle};
 
 pub async fn charger_ws(
     ws: WebSocketUpgrade,
@@ -29,16 +33,37 @@ pub async fn charger_ws(
     Query(query): Query<HashMap<String, String>>,
     uri: OriginalUri,
 ) -> impl IntoResponse {
+    let route = match parse_station_path(uri.path()) {
+        Ok(route) => route,
+        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
+    };
+    let id = match route {
+        StationRoute::Provider { id } => {
+            let provider = query
+                .get("id")
+                .filter(|value| !value.is_empty())
+                .cloned()
+                .unwrap_or_else(|| "unknown".to_string());
+            return open_provider(ws, state, id, provider).into_response();
+        }
+        StationRoute::ChargePoint { id } => id,
+    };
+    let record = match prepare_charger(&state, &id) {
+        Ok(record) => record,
+        Err(response) => return response,
+    };
+    let station = state.attach(&record);
     let offered = ws
         .requested_protocols()
         .filter_map(|value| value.to_str().ok())
         .collect::<Vec<_>>()
         .join(",");
     let mut hints = connection_hints(&headers, &query, uri.path());
+    hints.path = version_hint_path(uri.path());
     if !offered.is_empty() {
         hints.subprotocol = Some(offered.clone());
     }
-    let version = match resolve_version(&state.config_version(), state.auto_detect(), &hints) {
+    let version = match resolve_version(&record.ocpp_version, record.auto_detect, &hints) {
         Ok(version) => version,
         Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
     };
@@ -48,21 +73,48 @@ pub async fn charger_ws(
         ws
     };
     upgrade
-        .on_upgrade(move |socket| run_charger(socket, state, version))
+        .on_upgrade(move |socket| run_charger(socket, state, station, version))
         .into_response()
 }
 
-async fn run_charger(socket: WebSocket, state: AppState, version: OcppVersion) {
+fn prepare_charger(
+    state: &AppState,
+    id: &str,
+) -> Result<ocpp_proxy_application::ChargerRecord, axum::response::Response> {
+    match state.store().get_charger(id) {
+        Ok(Some(row)) if !row.enabled => Err(StatusCode::FORBIDDEN.into_response()),
+        Ok(Some(row)) => Ok(row),
+        Ok(None) => match state.store().enroll(id, &state.defaults()) {
+            Ok(EnrollOutcome::Created(row) | EnrollOutcome::Existing(row)) if row.enabled => {
+                Ok(row)
+            }
+            Ok(_) => Err(StatusCode::FORBIDDEN.into_response()),
+            Err(err) => Err((StatusCode::INTERNAL_SERVER_ERROR, err).into_response()),
+        },
+        Err(err) => Err((StatusCode::INTERNAL_SERVER_ERROR, err).into_response()),
+    }
+}
+
+async fn run_charger(
+    socket: WebSocket,
+    state: AppState,
+    station: StationHandle,
+    version: OcppVersion,
+) {
     let (out_tx, out_rx) = mpsc::unbounded_channel();
     let (in_tx, mut in_rx) = mpsc::unbounded_channel();
-    let cancel = state.root_cancel().child_token();
-    let generation = state.replace_charger(
+    let cancel = station.cancel().child_token();
+    let generation = station.replace_charger(
         ChargerLink {
             version,
             outbound: out_tx.clone(),
         },
         cancel.clone(),
     );
+    station.set_version(version);
+    let _ = state
+        .store()
+        .touch_last_seen(station.id(), &state.clock_iso());
     let cancel_peer = cancel.clone();
     let reader = tokio::spawn(async move {
         run_peer(AxumIo { socket }, out_rx, in_tx, cancel_peer).await;
@@ -72,22 +124,24 @@ async fn run_charger(socket: WebSocket, state: AppState, version: OcppVersion) {
             _ = cancel.cancelled() => break,
             call = in_rx.recv() => {
                 let Some(call) = call else { break };
-                dispatch(&state, version, call, &out_tx).await;
+                dispatch(&state, &station, version, call, &out_tx).await;
             }
         }
     }
-    state.clear_charger(generation);
+    station.clear_charger(generation);
+    station.clear_version();
     let _ = reader.await;
-    tracing::info!(version = version.as_str(), "charger disconnected");
+    tracing::info!(charger = station.id(), version = version.as_str(), "charger disconnected");
 }
 
 async fn dispatch(
     state: &AppState,
+    station: &StationHandle,
     version: OcppVersion,
     call: InboundCall,
     outbound: &mpsc::UnboundedSender<Outbound>,
 ) {
-    let frame = match handle(state, version, &call).await {
+    let frame = match handle(state, station, version, &call).await {
         Ok(payload) => Frame::Result {
             id: call.id,
             payload,
@@ -112,19 +166,24 @@ async fn dispatch(
 
 async fn handle(
     state: &AppState,
+    station: &StationHandle,
     version: OcppVersion,
     call: &InboundCall,
 ) -> Result<Value, String> {
     match (version, call.action.as_str()) {
-        (_, "BootNotification") => boot(state, version, &call.payload).await,
-        (_, "Heartbeat") => heartbeat(state, version).await,
-        (OcppVersion::V16, "StatusNotification") => status_v16(state, &call.payload).await,
-        (OcppVersion::V201, "StatusNotification") => status_v201(state, &call.payload).await,
-        (OcppVersion::V16, "MeterValues") => meter_v16(state, &call.payload).await,
-        (OcppVersion::V201, "MeterValues") => meter_v201(state, &call.payload).await,
-        (OcppVersion::V16, "StartTransaction") => start_v16(state, &call.payload).await,
-        (OcppVersion::V16, "StopTransaction") => stop_v16(state, &call.payload).await,
-        (OcppVersion::V201, "TransactionEvent") => transaction_event(state, &call.payload).await,
+        (_, "BootNotification") => boot(state, station, version, &call.payload).await,
+        (_, "Heartbeat") => heartbeat(state, station, version).await,
+        (OcppVersion::V16, "StatusNotification") => status_v16(state, station, &call.payload).await,
+        (OcppVersion::V201, "StatusNotification") => {
+            status_v201(state, station, &call.payload).await
+        }
+        (OcppVersion::V16, "MeterValues") => meter_v16(station, &call.payload).await,
+        (OcppVersion::V201, "MeterValues") => meter_v201(station, &call.payload).await,
+        (OcppVersion::V16, "StartTransaction") => start_v16(station, &call.payload).await,
+        (OcppVersion::V16, "StopTransaction") => stop_v16(state, station, &call.payload).await,
+        (OcppVersion::V201, "TransactionEvent") => {
+            transaction_event(state, station, &call.payload).await
+        }
         _ => Err(format!(
             "unsupported action {} for OCPP {}",
             call.action,
@@ -133,7 +192,12 @@ async fn handle(
     }
 }
 
-async fn boot(state: &AppState, version: OcppVersion, payload: &Value) -> Result<Value, String> {
+async fn boot(
+    state: &AppState,
+    station: &StationHandle,
+    version: OcppVersion,
+    payload: &Value,
+) -> Result<Value, String> {
     let (vendor, model, reason) = read_boot(version, payload)?;
     let now = Utc::now();
     let body = boot_result(version, now)?;
@@ -142,30 +206,45 @@ async fn boot(state: &AppState, version: OcppVersion, payload: &Value) -> Result
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
+    station.set_boot(&vendor, &model);
+    let _ = state
+        .store()
+        .touch_last_seen(station.id(), &state.clock_iso());
     on_boot(
         &vendor,
         &model,
         reason,
         &current,
-        state.backends(),
-        state.upstream(),
+        station.backends(),
+        station.upstream(),
     );
     tracing::info!(%vendor, %model, version = version.as_str(), "charger booted");
     Ok(body)
 }
 
-async fn heartbeat(state: &AppState, version: OcppVersion) -> Result<Value, String> {
+async fn heartbeat(
+    state: &AppState,
+    station: &StationHandle,
+    version: OcppVersion,
+) -> Result<Value, String> {
     let body = heartbeat_result(version, Utc::now())?;
     let current = body
         .get("currentTime")
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    on_heartbeat(&current, state.backends(), state.upstream());
+    let _ = state
+        .store()
+        .touch_last_seen(station.id(), &state.clock_iso());
+    on_heartbeat(&current, station.backends(), station.upstream());
     Ok(body)
 }
 
-async fn status_v16(state: &AppState, payload: &Value) -> Result<Value, String> {
+async fn status_v16(
+    state: &AppState,
+    station: &StationHandle,
+    payload: &Value,
+) -> Result<Value, String> {
     let status = json_str(payload, "status").unwrap_or("").to_string();
     let error = json_str(payload, "errorCode").unwrap_or("").to_string();
     let event = ChargerEvent::Status {
@@ -175,9 +254,9 @@ async fn status_v16(state: &AppState, payload: &Value) -> Result<Value, String> 
         status: status.clone(),
         timestamp: None,
     };
-    on_status(event, state.backends(), state.upstream());
+    on_status(event, station.backends(), station.upstream());
     if note_fault(
-        state.arbiter(),
+        station.arbiter(),
         state,
         &status,
         &fault_message_v16(&status, &error),
@@ -189,7 +268,11 @@ async fn status_v16(state: &AppState, payload: &Value) -> Result<Value, String> 
     Ok(serde_json::json!({}))
 }
 
-async fn status_v201(state: &AppState, payload: &Value) -> Result<Value, String> {
+async fn status_v201(
+    state: &AppState,
+    station: &StationHandle,
+    payload: &Value,
+) -> Result<Value, String> {
     let status = json_str(payload, "connectorStatus")
         .unwrap_or("")
         .to_string();
@@ -203,13 +286,13 @@ async fn status_v201(state: &AppState, payload: &Value) -> Result<Value, String>
         status: status.clone(),
         timestamp,
     };
-    on_status(event, state.backends(), state.upstream());
+    on_status(event, station.backends(), station.upstream());
     let message = fault_message_v201(&status, evse, connector);
-    let _ = note_fault(state.arbiter(), state, &status, &message).await;
+    let _ = note_fault(station.arbiter(), state, &status, &message).await;
     Ok(serde_json::json!({}))
 }
 
-async fn meter_v16(state: &AppState, payload: &Value) -> Result<Value, String> {
+async fn meter_v16(station: &StationHandle, payload: &Value) -> Result<Value, String> {
     let event = ChargerEvent::Meter {
         connector_id: Some(json_i64(payload, "connectorId", 0)),
         evse_id: None,
@@ -218,11 +301,11 @@ async fn meter_v16(state: &AppState, payload: &Value) -> Result<Value, String> {
             .cloned()
             .unwrap_or(serde_json::json!([])),
     };
-    on_meter(event, state.backends(), state.upstream());
+    on_meter(event, station.backends(), station.upstream());
     Ok(serde_json::json!({}))
 }
 
-async fn meter_v201(state: &AppState, payload: &Value) -> Result<Value, String> {
+async fn meter_v201(station: &StationHandle, payload: &Value) -> Result<Value, String> {
     let event = ChargerEvent::Meter {
         connector_id: None,
         evse_id: Some(json_i64(payload, "evseId", 0)),
@@ -231,15 +314,15 @@ async fn meter_v201(state: &AppState, payload: &Value) -> Result<Value, String> 
             .cloned()
             .unwrap_or(serde_json::json!([])),
     };
-    on_meter(event, state.backends(), state.upstream());
+    on_meter(event, station.backends(), station.upstream());
     Ok(serde_json::json!({}))
 }
 
-async fn start_v16(state: &AppState, payload: &Value) -> Result<Value, String> {
+async fn start_v16(station: &StationHandle, payload: &Value) -> Result<Value, String> {
     let timestamp = json_str(payload, "timestamp").unwrap_or("").to_string();
     let id_tag = json_str(payload, "idTag").unwrap_or("").to_string();
     let tx = {
-        let mut ledger = state.ledger();
+        let mut ledger = station.ledger();
         on_start(
             &mut ledger,
             StartInput {
@@ -248,17 +331,22 @@ async fn start_v16(state: &AppState, payload: &Value) -> Result<Value, String> {
                 meter_start: json_i64(payload, "meterStart", 0),
                 timestamp: &timestamp,
             },
-            state.backends(),
-            state.upstream(),
+            station.backends(),
+            station.upstream(),
         )
     };
     start_result_v16(tx)
 }
 
-async fn stop_v16(state: &AppState, payload: &Value) -> Result<Value, String> {
+async fn stop_v16(
+    state: &AppState,
+    station: &StationHandle,
+    payload: &Value,
+) -> Result<Value, String> {
     let tx = json_i64(payload, "transactionId", 0);
     finish_stop(
         state,
+        station,
         &tx.to_string(),
         json_i64(payload, "meterStop", 0),
         payload,
@@ -268,7 +356,11 @@ async fn stop_v16(state: &AppState, payload: &Value) -> Result<Value, String> {
     stop_result_v16()
 }
 
-async fn transaction_event(state: &AppState, payload: &Value) -> Result<Value, String> {
+async fn transaction_event(
+    state: &AppState,
+    station: &StationHandle,
+    payload: &Value,
+) -> Result<Value, String> {
     let event_type = json_str(payload, "eventType").unwrap_or("");
     let timestamp = json_str(payload, "timestamp").unwrap_or("").to_string();
     let tx = payload
@@ -292,7 +384,7 @@ async fn transaction_event(state: &AppState, payload: &Value) -> Result<Value, S
     match event_type {
         "Started" => {
             {
-                let mut ledger = state.ledger();
+                let mut ledger = station.ledger();
                 on_start_v201(
                     &mut ledger,
                     &tx,
@@ -302,8 +394,8 @@ async fn transaction_event(state: &AppState, payload: &Value) -> Result<Value, S
                         meter_start: meter,
                         timestamp: &timestamp,
                     },
-                    state.backends(),
-                    state.upstream(),
+                    station.backends(),
+                    station.upstream(),
                 );
             }
             transaction_event_result(true)
@@ -313,7 +405,7 @@ async fn transaction_event(state: &AppState, payload: &Value) -> Result<Value, S
                 .pointer("/transactionInfo/transactionId")
                 .cloned()
                 .unwrap_or(serde_json::json!(tx));
-            finish_stop(state, &tx, meter, payload, tx_json).await?;
+            finish_stop(state, station, &tx, meter, payload, tx_json).await?;
             transaction_event_result(true)
         }
         _ => transaction_event_result(false),
@@ -322,6 +414,7 @@ async fn transaction_event(state: &AppState, payload: &Value) -> Result<Value, S
 
 async fn finish_stop(
     state: &AppState,
+    station: &StationHandle,
     tx_id: &str,
     meter_stop: i64,
     payload: &Value,
@@ -333,14 +426,14 @@ async fn finish_stop(
     } else {
         first_meter(payload)
     };
-    let owner = state
+    let owner = station
         .arbiter()
         .lock()
         .unwrap_or_else(|err| err.into_inner())
         .lock_owner()
         .map(str::to_string);
     let message = {
-        let mut ledger = state.ledger();
+        let mut ledger = station.ledger();
         let logged_at = state.clock_iso();
         on_transaction_stop(
             &mut ledger,
@@ -352,9 +445,10 @@ async fn finish_stop(
                 transaction_id: tx_json,
                 owner: owner.as_deref(),
                 logged_at: &logged_at,
+                charger_id: station.id(),
             },
-            state.backends(),
-            state.upstream(),
+            station.backends(),
+            station.upstream(),
         )
     };
     if let Some(message) = message {

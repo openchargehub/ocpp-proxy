@@ -40,6 +40,7 @@ async fn boot_proxy_ha(
         lock_timeout: Duration::from_millis(200),
         ha_url,
         ha_token,
+        admin_token: None,
     })
     .await
     .unwrap()
@@ -837,5 +838,342 @@ async fn upstream_remote_start_reaches_the_charger() {
         ))
         .await
         .unwrap();
+    proxy.shutdown().await;
+}
+
+async fn boot_admin(yaml: &str, token: &str) -> RunningProxy {
+    let config = ProxyConfig::from_document(yaml).unwrap();
+    spawn(ProxyOptions {
+        config,
+        db_path: temp_path("db"),
+        bind: "127.0.0.1:0".parse().unwrap(),
+        lock_timeout: Duration::from_millis(200),
+        ha_url: None,
+        ha_token: None,
+        admin_token: Some(token.to_string()),
+    })
+    .await
+    .unwrap()
+}
+
+fn form_body(pairs: &[(&str, &str)]) -> String {
+    pairs
+        .iter()
+        .map(|(key, value)| format!("{}={}", form_escape(key), form_escape(value)))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+fn form_escape(text: &str) -> String {
+    let mut out = String::new();
+    for byte in text.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+async fn post_form(addr: SocketAddr, path: &str, pairs: &[(&str, &str)]) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("http://{addr}{path}"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(form_body(pairs))
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn no_text(
+    socket: &mut WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+) {
+    let waited = timeout(Duration::from_millis(300), text_from(socket)).await;
+    assert!(waited.is_err(), "unexpected frame: {waited:?}");
+}
+
+#[tokio::test]
+async fn two_charger_ids_do_not_share_events_or_the_lock() {
+    let proxy = boot_proxy(shared_yaml()).await;
+    let mut cyber = connect(proxy.addr, "/charger/CPCYBER01", Some("ocpp1.6"), &[]).await;
+    let mut viario = connect(proxy.addr, "/charger/CPVIARIO001", Some("ocpp1.6"), &[]).await;
+    let mut energy = connect(
+        proxy.addr,
+        "/charger/CPCYBER01/backend?id=energy",
+        None,
+        &[],
+    )
+    .await;
+    let mut fleet = connect(
+        proxy.addr,
+        "/charger/CPVIARIO001/backend?id=fleet",
+        None,
+        &[],
+    )
+    .await;
+    let boot = rpc(
+        &mut cyber,
+        "b1",
+        "BootNotification",
+        json!({"chargePointVendor": "Cyber", "chargePointModel": "One"}),
+    )
+    .await;
+    assert_eq!(boot[2]["status"], "Accepted");
+    let event: Value = serde_json::from_str(&text_from(&mut energy).await).unwrap();
+    assert_eq!(event["type"], "boot");
+    assert_eq!(event["vendor"], "Cyber");
+    no_text(&mut fleet).await;
+
+    energy
+        .send(Message::Text(
+            json!({"action": "RemoteStartTransaction", "connector_id": 1, "id_tag": "CYBER"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let frame: Value = serde_json::from_str(&text_from(&mut cyber).await).unwrap();
+    assert_eq!(frame[2], "RemoteStartTransaction");
+    assert_eq!(frame[3]["idTag"], "CYBER");
+    no_text(&mut viario).await;
+    cyber
+        .send(Message::Text(
+            json!([3, frame[1], {"status": "Accepted"}])
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let reply: Value = serde_json::from_str(&text_from(&mut energy).await).unwrap();
+    assert_eq!(reply["result"]["status"], "Accepted");
+
+    let cyber_status = get(&format!(
+        "http://{}/status?charger_id=CPCYBER01",
+        proxy.addr
+    ))
+    .await
+    .json::<Value>()
+    .await
+    .unwrap();
+    assert_eq!(cyber_status["lock_owner"], "energy");
+    let viario_status = get(&format!(
+        "http://{}/status?charger_id=CPVIARIO001",
+        proxy.addr
+    ))
+    .await
+    .json::<Value>()
+    .await
+    .unwrap();
+    assert!(viario_status["lock_owner"].is_null());
+    let default_status = get(&format!("http://{}/status", proxy.addr))
+        .await
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert!(default_status["lock_owner"].is_null());
+
+    fleet
+        .send(Message::Text(
+            json!({"action": "RemoteStartTransaction", "connector_id": 1, "id_tag": "FLEET"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let stolen: Value = serde_json::from_str(&text_from(&mut viario).await).unwrap();
+    assert_eq!(stolen[3]["idTag"], "FLEET");
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
+async fn first_connect_enrolls_and_disable_rejects_the_next_socket() {
+    let proxy = boot_admin(shared_yaml(), "secret").await;
+    let absent = get(&format!(
+        "http://{}/charger/CPVIARIO001/backend?id=fleet",
+        proxy.addr
+    ))
+    .await;
+    assert_eq!(absent.status(), 404);
+    let bad = get(&format!("http://{}/charger/bad%20id", proxy.addr)).await;
+    assert_eq!(bad.status(), 400);
+
+    let mut named = connect(
+        proxy.addr,
+        "/charger/CPCYBER01?version=2.0.1",
+        None,
+        &[],
+    )
+    .await;
+    let boot = rpc(
+        &mut named,
+        "b",
+        "BootNotification",
+        json!({"reason": "PowerUp", "chargingStation": {"vendorName": "Cyber", "model": "Wall"}}),
+    )
+    .await;
+    assert_eq!(boot[2]["status"], "Accepted");
+    drop(named);
+
+    let list = get(&format!("http://{}/chargers", proxy.addr)).await;
+    assert_eq!(list.status(), 200);
+    assert!(list.text().await.unwrap().contains("CPCYBER01"));
+
+    let hidden = get(&format!("http://{}/chargers/CPCYBER01", proxy.addr)).await;
+    assert_eq!(hidden.status(), 401);
+    let wrong = get(&format!(
+        "http://{}/chargers/CPCYBER01?token=nope",
+        proxy.addr
+    ))
+    .await;
+    assert_eq!(wrong.status(), 401);
+    let detail = get(&format!(
+        "http://{}/chargers/CPCYBER01?token=secret",
+        proxy.addr
+    ))
+    .await;
+    assert_eq!(detail.status(), 200);
+    let detail_html = detail.text().await.unwrap();
+    assert!(detail_html.contains("Cyber"));
+    assert!(detail_html.contains("Wall"));
+
+    let denied = post_form(
+        proxy.addr,
+        "/chargers/CPCYBER01/disable",
+        &[("token", "nope")],
+    )
+    .await;
+    assert_eq!(denied.status(), 401);
+    let disabled = post_form(
+        proxy.addr,
+        "/chargers/CPCYBER01/disable",
+        &[("token", "secret")],
+    )
+    .await;
+    assert!(disabled.status().is_redirection() || disabled.status().is_success());
+    assert_eq!(
+        get(&format!("http://{}/charger/CPCYBER01", proxy.addr))
+            .await
+            .status(),
+        403
+    );
+    assert_eq!(
+        get(&format!(
+            "http://{}/charger/CPCYBER01/backend?id=energy",
+            proxy.addr
+        ))
+        .await
+        .status(),
+        403
+    );
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
+async fn outbound_service_dials_only_the_charger_it_was_saved_on() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let csms_addr = listener.local_addr().unwrap();
+    let dials = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let dials_task = dials.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let dials_task = dials_task.clone();
+            tokio::spawn(async move {
+                let mut socket = accept_hdr_async(
+                    stream,
+                    |request: &tokio_tungstenite::tungstenite::http::Request<()>,
+                     mut response: tokio_tungstenite::tungstenite::http::Response<()>| {
+                        if let Some(protocol) = request.headers().get("sec-websocket-protocol") {
+                            response
+                                .headers_mut()
+                                .insert("sec-websocket-protocol", protocol.clone());
+                        }
+                        Ok(response)
+                    },
+                )
+                .await
+                .unwrap();
+                dials_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                while let Some(Ok(Message::Text(text))) = socket.next().await {
+                    let frame: Value = serde_json::from_str(&text).unwrap_or(json!([]));
+                    if frame.get(0).and_then(|item| item.as_i64()) == Some(2) {
+                        let reply = json!([3, frame[1], {"status": "Accepted", "currentTime": "2023-01-01T00:00:00Z", "interval": 10}]).to_string();
+                        if socket.send(Message::Text(reply.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    let proxy = boot_admin("allow_shared_charging: true\n", "secret").await;
+    let added = post_form(
+        proxy.addr,
+        "/chargers",
+        &[("token", "secret"), ("id", "CPCYBER01")],
+    )
+    .await;
+    assert!(added.status().is_success() || added.status().is_redirection());
+    let other = post_form(
+        proxy.addr,
+        "/chargers",
+        &[("token", "secret"), ("id", "CPVIARIO001")],
+    )
+    .await;
+    assert!(other.status().is_success() || other.status().is_redirection());
+    let saved = post_form(
+        proxy.addr,
+        "/chargers/CPCYBER01/services",
+        &[
+            ("token", "secret"),
+            ("id", "grid"),
+            ("url", &format!("ws://{csms_addr}")),
+            ("version", "1.6"),
+            ("auth_type", "basic"),
+            ("username", "user"),
+            ("password", "pass"),
+            ("enabled", "true"),
+        ],
+    )
+    .await;
+    assert!(saved.status().is_success() || saved.status().is_redirection());
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if dials.load(std::sync::atomic::Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("outbound dial");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(dials.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let cyber = get(&format!(
+        "http://{}/status?charger_id=CPCYBER01",
+        proxy.addr
+    ))
+    .await
+    .json::<Value>()
+    .await
+    .unwrap();
+    assert_eq!(cyber["ocpp_services"]["grid"]["connected"], true);
+    let viario = get(&format!(
+        "http://{}/status?charger_id=CPVIARIO001",
+        proxy.addr
+    ))
+    .await
+    .json::<Value>()
+    .await
+    .unwrap();
+    assert!(viario["ocpp_services"].get("grid").is_none());
+    let home = get(&format!("http://{}/", proxy.addr)).await;
+    let home_html = home.text().await.unwrap();
+    assert!(home_html.contains("CPCYBER01"));
+    assert!(!home_html.contains("pass"));
     proxy.shutdown().await;
 }
