@@ -3,9 +3,11 @@ use std::time::Duration;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use ocpp_proxy_application::{
-    remote_start, remote_stop, ChargerEvent, RemoteStart, RemoteStop, StartDecision, StopDecision,
+    remote_start, remote_stop, ChargerEvent, ChargerRegistry, RemoteStart, RemoteStop, ServiceRecord,
+    StartDecision, StopDecision,
 };
 use ocpp_proxy_domain::{OcppServiceConfig, OcppVersion};
+use tokio_util::sync::CancellationToken;
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
@@ -13,42 +15,57 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use crate::payload::{remote_result, stop_remote_result, upstream_boot};
 use crate::peer::{run_peer, InboundCall, Outbound, TungsteniteIo};
-use crate::state::AppState;
+use crate::state::{AppState, StationHandle};
 
-pub fn spawn_services(state: &AppState) {
-    for service in state.services() {
+pub fn spawn_services(state: &AppState, station: &StationHandle) {
+    let services = match state.store().list_services(station.id()) {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::error!(charger = station.id(), error = %err, "failed to read outbound services");
+            return;
+        }
+    };
+    let cancel = station.replace_service_cancel();
+    for service in services {
         if !service.enabled || service.url.is_empty() {
             continue;
         }
         let state = state.clone();
+        let station = station.clone();
+        let cancel = cancel.clone();
         tokio::spawn(async move {
-            if let Err(err) = run_service(service, state).await {
+            if let Err(err) = run_service(service, state, station, cancel).await {
                 tracing::error!(error = %err, "upstream service stopped");
             }
         });
     }
 }
 
-async fn run_service(service: OcppServiceConfig, state: AppState) -> Result<(), String> {
-    let version = parse_version(service.version());
+async fn run_service(
+    service: ServiceRecord,
+    state: AppState,
+    station: StationHandle,
+    cancel: CancellationToken,
+) -> Result<(), String> {
+    let version = parse_version(&service.version);
     let id = service.id.clone();
+    let config = to_config(&service);
     let socket = tokio::select! {
-        _ = state.root_cancel().cancelled() => return Ok(()),
-        connected = connect_service(&service, version) => match connected {
+        _ = cancel.cancelled() => return Ok(()),
+        connected = connect_service(&config, version) => match connected {
             Ok(socket) => socket,
             Err(err) => {
-                tracing::error!(service = %id, url = %service.url, error = %err, "failed to connect upstream");
+                tracing::error!(service = %id, url = %config.url, error = %err, "failed to connect upstream");
                 return Ok(());
             }
         }
     };
-    state
+    station
         .upstream()
         .set_status(&id, true, true, version.as_str());
     tracing::info!(service = %id, version = version.as_str(), "upstream connected");
     let (out_tx, out_rx) = mpsc::unbounded_channel();
     let (in_tx, mut in_rx) = mpsc::unbounded_channel();
-    let cancel = state.root_cancel().child_token();
     let peer_cancel = cancel.clone();
     let reader = tokio::spawn(async move {
         run_peer(TungsteniteIo { socket }, out_rx, in_tx, peer_cancel).await;
@@ -58,13 +75,13 @@ async fn run_service(service: OcppServiceConfig, state: AppState) -> Result<(), 
         outbound: out_tx.clone(),
     };
     let _ = link.call_boot().await;
-    let mut events = state.upstream().subscribe();
+    let mut events = station.upstream().subscribe();
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
             call = in_rx.recv() => {
                 let Some(call) = call else { break };
-                let payload = on_upstream_call(&state, &id, version, &call).await;
+                let payload = on_upstream_call(&state, &station, &id, version, &call).await;
                 let _ = out_tx.send(Outbound::Result { id: call.id, payload });
             }
             event = events.recv() => {
@@ -80,7 +97,7 @@ async fn run_service(service: OcppServiceConfig, state: AppState) -> Result<(), 
             }
         }
     }
-    state.upstream().remove(&id);
+    station.upstream().remove(&id);
     cancel.cancel();
     let _ = reader.await;
     Ok(())
@@ -136,6 +153,27 @@ fn auth_header(service: &OcppServiceConfig) -> Option<String> {
     }
 }
 
+fn to_config(service: &ServiceRecord) -> OcppServiceConfig {
+    OcppServiceConfig {
+        id: service.id.clone(),
+        url: service.url.clone(),
+        version: Some(service.version.clone()),
+        auth_type: blank(&service.auth_type),
+        username: blank(&service.username),
+        password: blank(&service.password),
+        token: blank(&service.token),
+        enabled: service.enabled,
+    }
+}
+
+fn blank(value: &str) -> Option<String> {
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
 fn parse_version(version: &str) -> OcppVersion {
     if version == "2.0.1" {
         OcppVersion::V201
@@ -146,12 +184,13 @@ fn parse_version(version: &str) -> OcppVersion {
 
 async fn on_upstream_call(
     state: &AppState,
+    station: &StationHandle,
     service_id: &str,
     version: OcppVersion,
     call: &InboundCall,
 ) -> Value {
     let backend_id = format!("ocpp_service_{service_id}");
-    let Some(charger) = state.charger_link() else {
+    let Some(charger) = station.charger_link() else {
         return rejected(version, &call.action);
     };
     match call.action.as_str() {
@@ -174,7 +213,7 @@ async fn on_upstream_call(
                 .unwrap_or("")
                 .to_string();
             let decision = remote_start(
-                state.arbiter(),
+                station.arbiter(),
                 state,
                 &charger,
                 state.clock(),
@@ -201,7 +240,7 @@ async fn on_upstream_call(
                 })
                 .unwrap_or_default();
             let decision = remote_stop(
-                state.arbiter(),
+                station.arbiter(),
                 state,
                 &charger,
                 state.clock(),

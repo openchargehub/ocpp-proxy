@@ -1,14 +1,17 @@
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
-use axum::response::IntoResponse;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use ocpp_proxy_application::{
-    remote_start, remote_stop, RemoteStart, RemoteStop, StartDecision, StopDecision,
+    remote_start, remote_stop, ChargerRegistry, RemoteStart, RemoteStop, StartDecision,
+    StopDecision,
 };
+use ocpp_proxy_domain::DEFAULT_STATION_ID;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
-use crate::state::AppState;
+use crate::state::{AppState, StationHandle};
 
 #[derive(Debug, Deserialize, Default)]
 pub(crate) struct BackendQuery {
@@ -19,18 +22,40 @@ pub async fn backend_ws(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
     Query(query): Query<BackendQuery>,
-) -> impl IntoResponse {
-    let id = query
+) -> Response {
+    let provider = query
         .id
         .filter(|id| !id.is_empty())
         .unwrap_or_else(|| "unknown".to_string());
-    ws.on_upgrade(move |socket| run_backend(socket, state, id))
+    open_provider(ws, state, DEFAULT_STATION_ID.to_string(), provider)
 }
 
-async fn run_backend(mut socket: WebSocket, state: AppState, id: String) {
+pub fn open_provider(
+    ws: WebSocketUpgrade,
+    state: AppState,
+    charger_id: String,
+    provider_id: String,
+) -> Response {
+    let record = match state.store().get_charger(&charger_id) {
+        Ok(Some(row)) if !row.enabled => return StatusCode::FORBIDDEN.into_response(),
+        Ok(Some(row)) => row,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(err) => return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response(),
+    };
+    let station = state.attach(&record);
+    ws.on_upgrade(move |socket| run_backend(socket, state, station, provider_id))
+        .into_response()
+}
+
+async fn run_backend(
+    mut socket: WebSocket,
+    state: AppState,
+    station: StationHandle,
+    id: String,
+) {
     let (tx, mut rx) = mpsc::unbounded_channel();
-    state.backends().insert(id.clone(), tx);
-    state
+    station.backends().insert(id.clone(), tx);
+    station
         .arbiter()
         .lock()
         .unwrap_or_else(|err| err.into_inner())
@@ -38,11 +63,11 @@ async fn run_backend(mut socket: WebSocket, state: AppState, id: String) {
     tracing::info!(backend = %id, "backend connected");
     loop {
         tokio::select! {
-            _ = state.root_cancel().cancelled() => break,
+            _ = station.cancel().cancelled() => break,
             incoming = socket.recv() => {
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
-                        let reply = on_backend_text(&state, &id, &text).await;
+                        let reply = on_backend_text(&state, &station, &id, &text).await;
                         if socket.send(Message::Text(reply.into())).await.is_err() {
                             break;
                         }
@@ -68,8 +93,8 @@ async fn run_backend(mut socket: WebSocket, state: AppState, id: String) {
             }
         }
     }
-    state.backends().remove(&id);
-    state
+    station.backends().remove(&id);
+    station
         .arbiter()
         .lock()
         .unwrap_or_else(|err| err.into_inner())
@@ -83,18 +108,23 @@ async fn run_backend(mut socket: WebSocket, state: AppState, id: String) {
     tracing::info!(backend = %id, "backend disconnected");
 }
 
-async fn on_backend_text(state: &AppState, id: &str, text: &str) -> String {
+async fn on_backend_text(
+    state: &AppState,
+    station: &StationHandle,
+    id: &str,
+    text: &str,
+) -> String {
     let Ok(body) = serde_json::from_str::<Value>(text) else {
         return json!({"error": "unknown_action"}).to_string();
     };
     let action = body.get("action").and_then(Value::as_str).unwrap_or("");
-    let Some(charger) = state.charger_link() else {
+    let Some(charger) = station.charger_link() else {
         return json!({"error": "unknown_action"}).to_string();
     };
     match action {
         "RemoteStartTransaction" => {
             let decision = remote_start(
-                state.arbiter(),
+                station.arbiter(),
                 state,
                 &charger,
                 state.clock(),
@@ -117,7 +147,7 @@ async fn on_backend_text(state: &AppState, id: &str, text: &str) -> String {
         }
         "RemoteStopTransaction" => {
             let decision = remote_stop(
-                state.arbiter(),
+                station.arbiter(),
                 state,
                 &charger,
                 state.clock(),
